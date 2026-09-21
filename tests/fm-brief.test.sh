@@ -899,7 +899,8 @@ test_ship_and_scout_teach_validation_round_pause() {
 }
 
 test_wait_declaration_instruction_placement() {
-  local home kind id brief verb
+  local home kind id brief verb rc declarations
+  local -a args
   home="$TMP_ROOT/wait-declaration-home"
   mkdir -p "$home/data"
 
@@ -907,42 +908,42 @@ test_wait_declaration_instruction_placement() {
     for kind in ship:no-mistakes ship:direct-PR ship:local-only scout secondmate; do
       id="wait-declaration-${kind//:/-}${verb:+-$verb}"
       case "$kind" in
-        ship:*)
-          FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
-            "$ROOT/bin/fm-brief.sh" "$id" firstmate --mode "${kind#ship:}" >/dev/null 2>&1
-          ;;
-        scout)
-          FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
-            "$ROOT/bin/fm-brief.sh" "$id" firstmate --scout >/dev/null 2>&1
-          ;;
-        secondmate)
-          FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
-            "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1
-          ;;
+        ship:*) args=("$id" firstmate --mode "${kind#ship:}") ;;
+        scout) args=("$id" firstmate --scout) ;;
+        secondmate) args=("$id" --secondmate --no-projects) ;;
       esac
+      FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
+        "$ROOT/bin/fm-brief.sh" "${args[@]}" >/dev/null 2>&1
+      rc=$?
+      expect_code 0 "$rc" "$kind scaffold (pause verb ${verb:-default}) must scaffold a brief"
       brief="$home/data/$id/brief.md"
+      assert_present "$brief" \
+        "$kind scaffold (pause verb ${verb:-default}) wrote no brief to $brief"
+
+      # The wait declaration is ONE shared instruction in rule 4's status
+      # protocol: every ship and scout brief renders exactly one stamped
+      # template, and the secondmate charter renders none. A per-mode copy
+      # returning to a Definition of done raises the count and fails here.
+      declarations=$(grep -c -F -- '[at=<epoch>]: {what you are waiting for}' "$brief")
       if [ "$kind" = secondmate ]; then
-        assert_no_grep 'When you settle into polling a validation round' "$brief" \
-          "secondmate charter carries the wait-declaration instruction it does not need"
+        [ "$declarations" = 0 ] || fail \
+          "secondmate charter renders $declarations wait-declaration templates; it must render none"
         continue
       fi
-      assert_grep 'When you settle into polling a validation round or any run you intend to sit and wait on,' \
-        "$brief" "$kind brief did not instruct declaring a wait before settling into a poll"
+      [ "$declarations" = 1 ] || fail \
+        "$kind brief renders $declarations wait-declaration templates; rule 4 must carry exactly one"
       # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
       assert_grep "append \`${verb:-paused} [at=<epoch>]: {what you are waiting for}\` before you start waiting" \
-        "$brief" "$kind brief did not render the configured pause verb in its wait-declaration line"
+        "$brief" "$kind brief did not render the configured pause verb and stamp in its wait declaration"
+      assert_grep 'When you settle into polling a validation round or any run you intend to sit and wait on,' \
+        "$brief" "$kind brief did not name settling into a poll as the trigger to declare the wait"
       assert_grep 'not once per poll - then append your next real line' "$brief" \
         "$kind brief did not bound the declaration to one line per wait"
       assert_grep 'a silent worker and a dead worker look identical' "$brief" \
-        "$kind brief did not give the reason for declaring the wait"
-      if [ -n "$verb" ]; then
-        # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
-        assert_no_grep 'append `paused [at=<epoch>]: {what you are waiting for}`' "$brief" \
-          "$kind brief still hardcodes the default pause verb in its wait-declaration line"
-      fi
+        "$kind brief did not give the reason a declared wait beats silence"
     done
   done
-  pass "fm-brief.sh: every ship and scout brief carries one wait-declaration instruction"
+  pass "fm-brief.sh: every ship and scout brief carries exactly one wait-declaration instruction"
 }
 
 test_scout_and_secondmate_load_decision_hold_policy() {
