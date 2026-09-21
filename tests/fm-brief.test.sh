@@ -327,12 +327,15 @@ test_faster_paths_use_configured_authority_without_stacked_review() {
 # lane that deliberately holds a draft declares a wait instead. local-only opens
 # no PR, so it must not carry the requirement.
 test_pr_based_dod_requires_non_draft() {
-  local home mode id brief
+  local home mode id brief verb spec
   home="$TMP_ROOT/draft-dod-home"
   mkdir -p "$home/data"
-  for mode in no-mistakes direct-PR local-only; do
-    id="brief-draft-$mode"
-    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$mode" >/dev/null 2>&1
+  for spec in no-mistakes: direct-PR: local-only: no-mistakes:awaiting direct-PR:awaiting local-only:awaiting; do
+    mode=${spec%%:*}
+    verb=${spec#*:}
+    id="brief-draft-$mode${verb:+-$verb}"
+    FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
+      "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$mode" >/dev/null 2>&1
     brief="$home/data/$id/brief.md"
     assert_present "$brief" "$mode: brief was not scaffolded"
     if [ "$mode" = local-only ]; then
@@ -345,8 +348,8 @@ test_pr_based_dod_requires_non_draft() {
     # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
     assert_grep 'mark it ready with `gh-axi pr ready`' "$brief" \
       "$mode: a draft must be marked ready before done"
-    assert_grep "If you deliberately keep the PR a draft, append \`paused" "$brief" \
-      "$mode: a deliberate draft must declare a wait instead of done"
+    assert_grep "append \`${verb:-paused} [at=<epoch>]: {why the draft is held}\`" "$brief" \
+      "$mode: a deliberate draft must declare a wait in the configured pause verb"
   done
   pass "fm-brief.sh: PR-based done requires a non-draft PR; a deliberate draft declares a wait"
 }
@@ -933,8 +936,10 @@ test_wait_declaration_instruction_placement() {
       [ "$declarations" = 1 ] || fail \
         "$kind brief renders $declarations wait-declaration templates; rule 4 must carry exactly one"
       # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-      assert_grep "append \`${verb:-paused} [at=<epoch>]: {what you are waiting for}\` before you start waiting" \
+      assert_grep "\`${verb:-paused} [at=<epoch>]: {what you are waiting for}\`" \
         "$brief" "$kind brief did not render the configured pause verb and stamp in its wait declaration"
+      assert_grep 'until <YYYY-MM-DDTHH:MMZ>' "$brief" \
+        "$kind brief did not offer the until bound that ends a declared wait's recheck window"
     done
   done
   pass "fm-brief.sh: every ship and scout brief carries exactly one wait-declaration instruction"

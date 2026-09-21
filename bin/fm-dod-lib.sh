@@ -245,7 +245,8 @@ EOF
 }
 
 fm_dod_block() {  # <mode> <task-id>
-  local mode=$1 id=$2
+  local mode=$1 id=$2 paused_verb
+  paused_verb=$(fm_classify_paused_verb)
   case "$mode" in
     direct-PR)
       cat <<EOF
@@ -257,7 +258,7 @@ When it is implemented and committed, push your branch and open a PR with \`gh-a
 Before you report done, read the PR back from the forge and confirm it is not a draft (\`gh pr view <url> --json isDraft\` must print false); if it is a draft, mark it ready with \`gh-axi pr ready\`.
 A draft cannot be merged, so a done report on one leaves the merge unasked.
 Then append \`done [at=<epoch>]: PR {url}\` to the status file and stop.
-If you deliberately keep the PR a draft, append \`paused [at=<epoch>]: {why the draft is held}\` instead of done.
+If you deliberately keep the PR a draft, append \`$paused_verb [at=<epoch>]: {why the draft is held}\` instead of done.
 Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
 EOF
       ;;
@@ -308,7 +309,7 @@ Two firstmate-specific rules layer on top of that guidance:
 After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), read the PR back from the forge and confirm it is not a draft (\`gh pr view <url> --json isDraft\` must print false); if it is a draft, mark it ready with \`gh-axi pr ready\`.
 A draft cannot be merged, so a done report on one leaves the merge unasked.
 Then append \`done [at=<epoch>]: PR {url} checks green\` and stop. You are finished.
-If you deliberately keep the PR a draft, append \`paused [at=<epoch>]: {why the draft is held}\` instead of done.
+If you deliberately keep the PR a draft, append \`$paused_verb [at=<epoch>]: {why the draft is held}\` instead of done.
 EOF
       ;;
     *)

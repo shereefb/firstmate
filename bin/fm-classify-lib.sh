@@ -90,6 +90,13 @@ FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|
 # drift between the two consumers. FM_CLASSIFY_PAUSED_VERB overrides it.
 FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 
+# fm_classify_paused_verb: the one accessor for the configured verb. Consumers
+# that render it into worker-facing text (bin/fm-brief.sh, bin/fm-dod-lib.sh)
+# read it here rather than repeating the override expression.
+fm_classify_paused_verb() {
+  printf '%s\n' "${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}"
+}
+
 # Bounded re-surface cadence for a declared external-wait pause.
 # Far longer than the wedge threshold (FM_STALE_ESCALATE_SECS, default 240s), it
 # avoids nagging a deliberate wait while ensuring a forgotten wait cannot rot
