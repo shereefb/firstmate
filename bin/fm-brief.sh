@@ -111,6 +111,10 @@ esac
 . "$SCRIPT_DIR/fm-dod-lib.sh"
 PAUSED_VERB=${FM_CLASSIFY_PAUSED_VERB:-$FM_CLASSIFY_PAUSED_VERB_DEFAULT}
 CREWMATE_PAUSE_WAIT_EXAMPLES='an upstream release, a rate-limit reset, a scheduled window, or your own validation round'
+CREWMATE_WAIT_DECLARATION="   When you settle into polling a validation round or any run you intend to sit and wait on,
+   append \`$PAUSED_VERB [at=<epoch>]: {what you are waiting for}\` before you start waiting - once for the wait,
+   not once per poll - then append your next real line (\`working:\`, \`needs-decision:\`, \`done:\`, or \`failed:\`)
+   when it ends: from outside, a silent worker and a dead worker look identical."
 
 resolve_directory_input() {
   local name=$1 path=$2 resolved
@@ -438,8 +442,7 @@ The report is the only thing that survives, so anything worth keeping must be in
    firstmate then leaves your idle pane alone and rechecks it on a long cadence instead of
    treating it as a possible wedge. When you know when the wait clears, say so in the line with
    \`until <YYYY-MM-DDTHH:MMZ>\` (UTC) and firstmate rechecks at that time instead.
-   When you settle into polling a long run you intend to sit and wait on, append one \`$PAUSED_VERB:\` line naming what you wait for before you start, once for the wait and not once per poll,
-   then append your next real line when it ends: a silent worker and a dead worker look identical from outside.
+$CREWMATE_WAIT_DECLARATION
    Use \`blocked:\` when you are stuck and need help.
 5. If you hit the same obstacle twice, append \`blocked [at=<epoch>]: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
@@ -530,7 +533,9 @@ $RULE1
    Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
    known external wait you expect to clear on its own ($CREWMATE_PAUSE_WAIT_EXAMPLES):
    firstmate then leaves your idle pane alone and rechecks it on a long
-   cadence instead of treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
+   cadence instead of treating it as a possible wedge.
+$CREWMATE_WAIT_DECLARATION
+   Use \`blocked:\` when you are stuck and need help.
 5. If you hit the same obstacle twice, append \`blocked [at=<epoch>]: {why}\` and stop; firstmate will help.
 6. If a decision belongs above the implementation worker (product choices, destructive actions),
    append \`needs-decision [at=<epoch>]: {summary of options}\` and stop. Firstmate will reply with the decision.

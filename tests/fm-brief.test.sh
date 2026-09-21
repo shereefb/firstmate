@@ -899,39 +899,50 @@ test_ship_and_scout_teach_validation_round_pause() {
 }
 
 test_wait_declaration_instruction_placement() {
-  local home id brief
+  local home kind id brief verb
   home="$TMP_ROOT/wait-declaration-home"
   mkdir -p "$home/data"
 
-  for id in ship-nm:--mode:no-mistakes ship-pr:--mode:direct-PR scout:--scout: secondmate:--secondmate:--no-projects; do
-    local name=${id%%:*} rest=${id#*:} a b
-    a=${rest%%:*}; b=${rest#*:}
-    if [ "$name" = secondmate ]; then
-      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "wait-$name" "$a" "$b" >/dev/null 2>&1
-    elif [ -n "$b" ]; then
-      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "wait-$name" firstmate "$a" "$b" >/dev/null 2>&1
-    else
-      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "wait-$name" firstmate "$a" >/dev/null 2>&1
-    fi
-    brief="$home/data/wait-$name/brief.md"
-    case "$name" in
-      ship-nm)
-        assert_grep 'append one `paused [at=<epoch>]: {what you are waiting for}` line, once for the wait and not once per poll' "$brief" \
-          "no-mistakes ship brief did not instruct declaring the wait when polling"
-        assert_grep 'a silent worker and a dead worker look identical' "$brief" \
-          "no-mistakes ship brief did not give the reason for declaring the wait"
-        ;;
-      scout)
-        assert_grep 'append one `paused:` line naming what you wait for before you start' "$brief" \
-          "scout brief did not instruct declaring a long wait"
-        ;;
-      *)
-        assert_no_grep 'once for the wait and not once per poll' "$brief" \
-          "$name brief carries the wait-declaration instruction it does not need"
-        ;;
-    esac
+  for verb in "" awaiting; do
+    for kind in ship:no-mistakes ship:direct-PR ship:local-only scout secondmate; do
+      id="wait-declaration-${kind//:/-}${verb:+-$verb}"
+      case "$kind" in
+        ship:*)
+          FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
+            "$ROOT/bin/fm-brief.sh" "$id" firstmate --mode "${kind#ship:}" >/dev/null 2>&1
+          ;;
+        scout)
+          FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
+            "$ROOT/bin/fm-brief.sh" "$id" firstmate --scout >/dev/null 2>&1
+          ;;
+        secondmate)
+          FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
+            "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1
+          ;;
+      esac
+      brief="$home/data/$id/brief.md"
+      if [ "$kind" = secondmate ]; then
+        assert_no_grep 'When you settle into polling a validation round' "$brief" \
+          "secondmate charter carries the wait-declaration instruction it does not need"
+        continue
+      fi
+      assert_grep 'When you settle into polling a validation round or any run you intend to sit and wait on,' \
+        "$brief" "$kind brief did not instruct declaring a wait before settling into a poll"
+      # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
+      assert_grep "append \`${verb:-paused} [at=<epoch>]: {what you are waiting for}\` before you start waiting" \
+        "$brief" "$kind brief did not render the configured pause verb in its wait-declaration line"
+      assert_grep 'not once per poll - then append your next real line' "$brief" \
+        "$kind brief did not bound the declaration to one line per wait"
+      assert_grep 'a silent worker and a dead worker look identical' "$brief" \
+        "$kind brief did not give the reason for declaring the wait"
+      if [ -n "$verb" ]; then
+        # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+        assert_no_grep 'append `paused [at=<epoch>]: {what you are waiting for}`' "$brief" \
+          "$kind brief still hardcodes the default pause verb in its wait-declaration line"
+      fi
+    done
   done
-  pass "fm-brief.sh: wait-declaration instruction sits in the shapes that drive long runs only"
+  pass "fm-brief.sh: every ship and scout brief carries one wait-declaration instruction"
 }
 
 test_scout_and_secondmate_load_decision_hold_policy() {

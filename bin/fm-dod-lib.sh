@@ -295,9 +295,6 @@ Do not hand-edit, commit, or fix findings yourself while a run is active - the p
 One drive call blocks until the next gate or outcome, which routinely outlives what your harness lets a single command run: Claude Code kills a command at ten minutes maximum, while one fix round is capped around thirty minutes and up to three rounds chain.
 So background the drive call and poll \`no-mistakes axi status\` from a separate call instead of sitting in one blocking hold your harness will kill.
 Where a harness's own command limit is not established, assume it bounds commands and use that same background-and-poll shape.
-The moment you settle into polling, append one \`paused [at=<epoch>]: {what you are waiting for}\` line, once for the wait and not once per poll, and append your next real line (\`working:\`, \`needs-decision:\`, \`done:\`, or \`failed:\`) when it ends.
-From outside, a silent worker and a dead worker look identical; a declared wait is rechecked on a long cadence, while undeclared silence is escalated as a possible wedge.
-Apply the same rule to any other run you intend to sit and wait on.
 A killed or timed-out call is never evidence the daemon died: the daemon accepts your response immediately and runs the round in the background, so the call was only ever waiting for a read while the run kept working.
 Reattach and keep going rather than reporting the pipeline blocked; rule 7 owns the checks that decide when a pipeline block is real.
 
