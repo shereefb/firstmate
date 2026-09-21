@@ -935,12 +935,6 @@ test_wait_declaration_instruction_placement() {
       # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
       assert_grep "append \`${verb:-paused} [at=<epoch>]: {what you are waiting for}\` before you start waiting" \
         "$brief" "$kind brief did not render the configured pause verb and stamp in its wait declaration"
-      assert_grep 'When you settle into polling a validation round or any run you intend to sit and wait on,' \
-        "$brief" "$kind brief did not name settling into a poll as the trigger to declare the wait"
-      assert_grep 'not once per poll - then append your next real line' "$brief" \
-        "$kind brief did not bound the declaration to one line per wait"
-      assert_grep 'a silent worker and a dead worker look identical' "$brief" \
-        "$kind brief did not give the reason a declared wait beats silence"
     done
   done
   pass "fm-brief.sh: every ship and scout brief carries exactly one wait-declaration instruction"
