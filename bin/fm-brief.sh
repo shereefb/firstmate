@@ -438,6 +438,8 @@ The report is the only thing that survives, so anything worth keeping must be in
    firstmate then leaves your idle pane alone and rechecks it on a long cadence instead of
    treating it as a possible wedge. When you know when the wait clears, say so in the line with
    \`until <YYYY-MM-DDTHH:MMZ>\` (UTC) and firstmate rechecks at that time instead.
+   When you settle into polling a long run you intend to sit and wait on, append one \`$PAUSED_VERB:\` line naming what you wait for before you start, once for the wait and not once per poll,
+   then append your next real line when it ends: a silent worker and a dead worker look identical from outside.
    Use \`blocked:\` when you are stuck and need help.
 5. If you hit the same obstacle twice, append \`blocked [at=<epoch>]: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),

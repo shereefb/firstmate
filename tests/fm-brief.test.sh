@@ -898,6 +898,42 @@ test_ship_and_scout_teach_validation_round_pause() {
   pass "fm-brief.sh: ship and scout scaffolds teach validation-round pauses"
 }
 
+test_wait_declaration_instruction_placement() {
+  local home id brief
+  home="$TMP_ROOT/wait-declaration-home"
+  mkdir -p "$home/data"
+
+  for id in ship-nm:--mode:no-mistakes ship-pr:--mode:direct-PR scout:--scout: secondmate:--secondmate:--no-projects; do
+    local name=${id%%:*} rest=${id#*:} a b
+    a=${rest%%:*}; b=${rest#*:}
+    if [ "$name" = secondmate ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "wait-$name" "$a" "$b" >/dev/null 2>&1
+    elif [ -n "$b" ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "wait-$name" firstmate "$a" "$b" >/dev/null 2>&1
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "wait-$name" firstmate "$a" >/dev/null 2>&1
+    fi
+    brief="$home/data/wait-$name/brief.md"
+    case "$name" in
+      ship-nm)
+        assert_grep 'append one `paused [at=<epoch>]: {what you are waiting for}` line, once for the wait and not once per poll' "$brief" \
+          "no-mistakes ship brief did not instruct declaring the wait when polling"
+        assert_grep 'a silent worker and a dead worker look identical' "$brief" \
+          "no-mistakes ship brief did not give the reason for declaring the wait"
+        ;;
+      scout)
+        assert_grep 'append one `paused:` line naming what you wait for before you start' "$brief" \
+          "scout brief did not instruct declaring a long wait"
+        ;;
+      *)
+        assert_no_grep 'once for the wait and not once per poll' "$brief" \
+          "$name brief carries the wait-declaration instruction it does not need"
+        ;;
+    esac
+  done
+  pass "fm-brief.sh: wait-declaration instruction sits in the shapes that drive long runs only"
+}
+
 test_scout_and_secondmate_load_decision_hold_policy() {
   local home scout charter
   home="$TMP_ROOT/decision-policy-home"
@@ -1083,6 +1119,7 @@ test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_ship_and_scout_teach_validation_round_pause
+test_wait_declaration_instruction_placement
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
 test_scout_lavish_line_follows_presentation_floor
