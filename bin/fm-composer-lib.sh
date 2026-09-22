@@ -1442,10 +1442,13 @@ _fm_composer_select_cursorless() {
     FM_COMPOSER_SELECTED_FIRST=$FM_COMPOSER_SCAN_LEFTBAR_START
     FM_COMPOSER_SELECTED_LAST=$FM_COMPOSER_SCAN_LEFTBAR_END
   fi
-  if [ "$FM_COMPOSER_SCAN_INCOMPLETE_BOX_FROM" -gt "$generic" ]; then
-    FM_COMPOSER_SELECTED_KIND=
-    return 1
-  fi
+  # The pi pair is a COMPLETE live shape, so it advances `generic` exactly as a
+  # proven box does. It must do so BEFORE the incomplete-box refusal below:
+  # that refusal asks whether a malformed box sits at or below the selected
+  # shape, and stale scrollback structure ABOVE a newer live pair - a transcript
+  # table box that never closed - must not shadow it. Counting the pair first
+  # keeps the refusal for an incomplete box BELOW the pair, where the pair
+  # really is the stale shape.
   if [ "$FM_COMPOSER_SCAN_PI_PAIR_FOUND" = 1 ] \
      && [ "$FM_COMPOSER_SCAN_PI_CLOSE" -gt "$generic" ] \
      && [ "$generic" -lt "$FM_COMPOSER_SCAN_PI_OPEN" ]; then
@@ -1453,6 +1456,10 @@ _fm_composer_select_cursorless() {
     FM_COMPOSER_SELECTED_KIND=pi
     FM_COMPOSER_SELECTED_FIRST=$((FM_COMPOSER_SCAN_PI_OPEN + 1))
     FM_COMPOSER_SELECTED_LAST=$((FM_COMPOSER_SCAN_PI_CLOSE - 1))
+  fi
+  if [ "$FM_COMPOSER_SCAN_INCOMPLETE_BOX_FROM" -gt "$generic" ]; then
+    FM_COMPOSER_SELECTED_KIND=
+    return 1
   fi
   if [ "$FM_COMPOSER_SCAN_PI_PAIR_FOUND" = 0 ] \
      && [ "$FM_COMPOSER_SCAN_PI_LAST_SEPARATOR" -gt "$generic" ]; then

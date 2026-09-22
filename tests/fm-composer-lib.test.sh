@@ -848,6 +848,31 @@ test_incomplete_lower_box_invalidates_stale_candidate() {
   pass "fm_composer_classify_screen: incomplete lower structure invalidates stale boxes"
 }
 
+test_stale_incomplete_box_above_live_pi_pair() {
+  # task fm-pi-composer-stale-box-exit (COD-5145): a stale, never-closed
+  # transcript table box ABOVE the live pi composer must not shadow it. The
+  # bottom-most candidate wins, and the pi pair is a COMPLETE live shape, so
+  # it advances the selection boundary exactly as a proven box does. The Zues
+  # screen had an incomplete table box from row 10 and a valid pair at rows
+  # 15..17 under a native pi/done identity; the stale box made the cursorless
+  # selection refuse before the newer pair was ever considered.
+  local box pair_blank pair_typed pair_below pi_idle
+  pi_idle=$(printf 'pi\tidle')
+  box=$'transcript one\ntranscript two\n╭───────────────────────╮\n│ table header  │ value  │\n│ row           │ 1      │\n'
+  pair_blank=$'────────────────────────\n\n────────────────────────\n  status footer'
+  assert_screen "stale incomplete box above an empty pi pair" empty "$CAPS_STYLED" "$box$pair_blank" '' "$pi_idle"
+  # DIVERGENCE: the same stale box over a pair holding real input still reads
+  # pending, so the fix lets only the newer composer win, never its text.
+  pair_typed=$'────────────────────────\nfix the flaky test\n────────────────────────\n  status footer'
+  assert_screen "stale incomplete box above a typed pi pair" pending "$CAPS_STYLED" "$box$pair_typed" '' "$pi_idle"
+  # And an incomplete box BELOW the pair still invalidates the pair as stale.
+  pair_below=$'transcript\n────────────────────────\n\n────────────────────────\n╭───────────────────────╮\n│ table header  │ value  │\n│ row           │ 1      │'
+  assert_screen "incomplete box below the pi pair refuses" unknown "$CAPS_STYLED" "$pair_below" '' "$pi_idle"
+  # No live identity is no proof: the pair alone stays unprovable, stale box or not.
+  assert_screen "stale box above an unproven pi pair" unknown "$CAPS_STYLED" "$box$pair_blank" '' probe-absent
+  pass "fm_composer_classify_screen: a stale incomplete box above the live pi pair does not shadow it"
+}
+
 test_titled_bottom_requires_matching_width() {
   local screen out
   screen=$'╭────────────────────────╮\n│ ❯                      │\n╰─ Grok ─╯'
@@ -940,6 +965,7 @@ test_cursorless_bare_wrap_region_classifies
 test_cursorless_container_rejects_contiguous_lower_activity
 test_bottom_most_candidate_wins
 test_incomplete_lower_box_invalidates_stale_candidate
+test_stale_incomplete_box_above_live_pi_pair
 test_titled_bottom_requires_matching_width
 test_cursor_on_proven_box_bottom_classifies_content
 test_selected_content_is_composer_scoped_and_wrap_normalized
