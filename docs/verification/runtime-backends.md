@@ -1207,6 +1207,30 @@ Cross-session and contradictory bindings are covered deterministically in `tests
 
 ### Per-home and presentation topology
 
+The Operating Studio inventory guard ran on 2026-09-22 against the required Herdr 0.7.4 protocol 16 pin in a private named lab session:
+
+```sh
+pin=$(mktemp -d)
+trap 'rm -rf "$pin"' EXIT
+bin/fm-install-herdr.sh "$pin"
+PATH="$pin:$PATH" bin/fm-test-run.sh tests/fm-herdr-linear-inventory-live-e2e.test.sh
+```
+
+It moved the registered owner pane through an intermediate workspace created from a different directory and into a final workspace under a worker-shaped tab.
+The first public `--inventory` call had no exact record for the intermediate workspace and had to request manual inspection instead of reporting a false clean.
+The guard then recorded the intermediate child endpoint and reran `--inventory` against the real owner, workspace, tab, pane, agent, and process responses.
+The old registered workspace retained a flat child, and an exact version 2 projection journal bound a third child through its own workspace and the old parent.
+
+```text
+ok - real Herdr inventory requests inspection for unproven owner workspace history
+ok - real Herdr inventory keeps workers after repeated owner moves and tab renames
+ok - real Herdr inventory excludes the exact moved owner pane
+evidence: herdr 0.7.4 protocol=16
+```
+
+The first result rejected unproven workspace history.
+After the exact endpoint record closed that gap, the result reported verified ownership, included all three live children, and excluded the moved owner by its exact pane identity rather than its mutable tab label.
+
 Per-home behavior is owned by:
 
 ```sh

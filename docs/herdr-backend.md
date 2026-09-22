@@ -210,11 +210,37 @@ herdr_session=<session>
 herdr_workspace_id=<workspace-id>
 herdr_tab_id=<tab-id>
 herdr_pane_id=<pane-id>
+linear_card_id=<Linear issue id, when the task is bound to an Operating Studio card>
 ```
 
 A Herdr pane id contains a colon, so the adapter splits `window=` on the first colon only.
 The recorded pane is the operational fast path.
 Workspace and tab ids support verification and cleanup but are not inferred from mutable labels during normal operation.
+
+## Operating Studio reconciliation
+
+`bin/fm-herdr-linear-reconcile.sh` provides a read-only first pass for Operating Studio's In Progress and In Review Linear cards.
+A task records its immutable Linear issue id as `linear_card_id=` through `fm-spawn.sh --linear-card-id <id>`.
+The command joins that id to the card id and joins the task to its recorded Herdr session and pane ids, never to titles, pane order, or totals.
+The comparison command runs `--linear-api` with `LINEAR_API_KEY`, `FM_LINEAR_OPERATING_STUDIO_TEAM_ID`, and `FM_LINEAR_OPERATING_STUDIO_PROJECT_ID` set locally.
+Comparison resolves the `zues` secondmate through the primary home's `data/secondmates.md` and obtains a fresh inventory from the registered local home or through its registered `fm-on.sh` route.
+The primary rejects an unavailable route, invalid returned inventory, or returned home that differs from the registered home.
+API mode refuses to run without both identities, filters by both, and reads every result page.
+The command always emits one JSON object that names exact identity, verified-live-worker count, duplicate, and home-scoped endpoint discrepancies as well as `needs-deep-check` results.
+The persistent `buildboard` secondmate is the sole automatic owner.
+Put its read-only Linear credential and the two Operating Studio identities in that home's gitignored `.env`, then run `bin/fm-herdr-linear-check.sh arm` from that local secondmate home.
+Run `bin/fm-herdr-linear-check.sh inspect` there for a fresh one-shot result through the same configuration and primary registry route.
+The check reads those three values fresh from `.env`, resolves the primary from buildboard's durable parent binding, and uses only the primary's registered Zeus route for each fresh inventory.
+Each inventory joins workers from exact workspaces named by the owning secondmate's registered record, current live endpoint, canonical home creation directory, task endpoint records, or a version 2 projection binding for the physical home.
+It maps live panes to task identities only through recorded endpoints, so tab renames do not change identity. An unidentified live pane or an unavailable or ambiguous ownership read fails closed instead of returning a partial match.
+When the owner has moved, every workspace in that Herdr session must belong to this exact set. Otherwise inventory fails with a manual-inspection request because an intervening owner workspace cannot be ruled out.
+Owner workspace moves do not create discrepancies when task endpoint records or another exact binding prove every intervening workspace and the workers match their cards.
+The command idempotently installs one hash-bound custom check on the existing watcher, gates reconciliation to one run every 15 minutes, and applies an internal deadline three seconds below the watcher timeout.
+It stays silent when every identity and count matches, and emits one actionable line when deeper inspection is needed, reconciliation fails, or cadence state cannot be saved.
+This uses no cron, background loop, or second coordinator, and the credential is never written into the tracked shim or repository.
+`tests/fm-herdr-linear-reconcile.test.sh` covers the portable behavior.
+`tests/fm-herdr-linear-check.test.sh` covers automatic ownership and lifecycle behavior.
+`tests/fm-herdr-linear-inventory-live-e2e.test.sh` verifies repeated owner moves, renamed tabs, and registered, current, and projected worker inventory against a real isolated Herdr session.
 
 ## Current transport behavior
 

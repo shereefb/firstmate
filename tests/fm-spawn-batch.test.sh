@@ -143,8 +143,41 @@ test_scout_batch_refuses_delivery_flags() {
   pass "scout batch refuses ship delivery flags instead of ignoring them"
 }
 
+test_linear_card_binding_is_single_pair_only() {
+  local out status fake_root args
+  out=$(run_ship_spawn nope-batch-card-z13=projects/none-a nope-batch-card-z14=projects/none-b --linear-card-id card-os-13)
+  status=$?
+  [ "$status" -ne 0 ] || fail "a multi-pair batch accepted one shared Linear card id"
+  printf '%s\n' "$out" | grep -F -- '--linear-card-id supports only a single id=repo pair' >/dev/null \
+    || fail "multi-pair Linear binding refusal was unclear: $out"
+  printf '%s\n' "$out" | grep -F 'batch:' >/dev/null \
+    && fail "multi-pair Linear binding dispatched a task before refusal"
+
+  fake_root="$TMP_ROOT/linear-card-forward"
+  mkdir -p "$fake_root/bin" "$fake_root/state" "$fake_root/data" "$fake_root/config"
+  args="$fake_root/args"
+  cat > "$fake_root/bin/fm-spawn.sh" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$args"
+SH
+  chmod +x "$fake_root/bin/fm-spawn.sh"
+  FM_ROOT_OVERRIDE="$fake_root" FM_HOME="$fake_root" FM_STATE_OVERRIDE='' \
+    FM_DATA_OVERRIDE='' FM_PROJECTS_OVERRIDE='' FM_CONFIG_OVERRIDE='' \
+    FM_SPAWN_NO_GUARD=1 FM_BACKEND=tmux \
+    "$SPAWN" nope-batch-card-z15=projects/none --mode no-mistakes --yolo off \
+      --linear-card-id card-os-15 >/dev/null 2>&1 \
+    || fail "single-pair Linear binding did not dispatch"
+  [ -f "$args" ] || fail "single-pair dispatch did not reach its child invocation"
+  awk '
+    $0 == "--linear-card-id" { getline; found = ($0 == "card-os-15") }
+    END { exit(found ? 0 : 1) }
+  ' "$args" || fail "single-pair dispatch dropped its Linear card binding"
+  pass "Linear card binding is forwarded to one pair and refused for many"
+}
+
 test_batch_dispatches_every_pair
 test_batch_mode_boundaries
 test_batch_requires_the_shared_delivery_contract
 test_scout_batch_refuses_delivery_flags
+test_linear_card_binding_is_single_pair_only
 test_projects_path_scoping
