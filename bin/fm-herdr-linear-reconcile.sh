@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# fm-herdr-linear-reconcile.sh - read-only first-pass Operating Studio reconciliation.
+#
+# Usage:
+#   fm-herdr-linear-reconcile.sh --inventory --json
+#   fm-herdr-linear-reconcile.sh --cards <Linear-response.json> [--zeus-inventory <inventory.json>] [--json]
+#   fm-herdr-linear-reconcile.sh --linear-api [--zeus-inventory <inventory.json>] [--json]
+#
+# `--inventory` is run by each owning home. It reads only that home's direct
+# child metadata and asks Herdr for each recorded endpoint. A parent receives a
+# secondmate inventory as an input; it never enumerates the secondmate's panes.
+# The comparison joins a Linear issue's immutable `id` to `linear_card_id=` in
+# task metadata, and endpoint identity to the task's recorded Herdr ids. It
+# deliberately does not inspect pane text, fm-crew-state, validation, or PRs.
+# Any case those deeper checks must settle is reported as needs-deep-check.
+#
+# `--cards` accepts either Linear's GraphQL response
+# `{data:{issues:{nodes:[...]}}}` or `{cards:[...]}` with id, identifier, and
+# state fields. `--linear-api` fetches the same source using LINEAR_API_KEY and
+# FM_LINEAR_OPERATING_STUDIO_TEAM_ID. It never prints either secret.
+#
+# Output is schema fm-herdr-linear-reconcile.v1. `--json` prints one stable
+# machine-readable object; the default is a concise summary followed by the
+# same object on stdout. This script is observational: it never changes Linear,
+# task records, panes, or worker lifecycle.
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+
+# shellcheck source=bin/fm-backend.sh
+. "$SCRIPT_DIR/fm-backend.sh"
+
+MODE=compare
+CARDS_FILE=
+ZEUS_INVENTORY=
+JSON_ONLY=0
+LINEAR_API=0
+
+usage() {
+  cat <<'EOF'
+usage: fm-herdr-linear-reconcile.sh --inventory --json
+       fm-herdr-linear-reconcile.sh --cards <Linear-response.json> [--zeus-inventory <inventory.json>] [--json]
+       fm-herdr-linear-reconcile.sh --linear-api [--zeus-inventory <inventory.json>] [--json]
+
+Read-only Herdr and Linear reconciliation for Operating Studio cards.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --inventory) MODE=inventory ;;
+    --cards)
+      shift
+      [ "$#" -gt 0 ] || { echo 'fm-herdr-linear-reconcile: --cards requires a file' >&2; exit 2; }
+      CARDS_FILE=$1
+      ;;
+    --zeus-inventory)
+      shift
+      [ "$#" -gt 0 ] || { echo 'fm-herdr-linear-reconcile: --zeus-inventory requires a file' >&2; exit 2; }
+      ZEUS_INVENTORY=$1
+      ;;
+    --linear-api) LINEAR_API=1 ;;
+    --json) JSON_ONLY=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ "$MODE" = inventory ] || {
+  [ -n "$CARDS_FILE" ] || [ "$LINEAR_API" = 1 ] || {
+    echo 'fm-herdr-linear-reconcile: choose --cards or --linear-api' >&2
+    exit 2
+  }
+  [ -z "$CARDS_FILE" ] || [ "$LINEAR_API" = 0 ] || {
+    echo 'fm-herdr-linear-reconcile: --cards and --linear-api are mutually exclusive' >&2
+    exit 2
+  }
+}
+[ "$MODE" = compare ] || {
+  [ -z "$ZEUS_INVENTORY" ] && [ "$LINEAR_API" = 0 ] && [ -z "$CARDS_FILE" ] || {
+    echo 'fm-herdr-linear-reconcile: --inventory accepts only --json' >&2
+    exit 2
+  }
+}
+
+command -v jq >/dev/null 2>&1 || {
+  echo 'fm-herdr-linear-reconcile: jq is required' >&2
+  exit 1
+}
+command -v herdr >/dev/null 2>&1 || {
+  echo 'fm-herdr-linear-reconcile: Herdr is unavailable; this Herdr-specific check cannot run' >&2
+  exit 1
+}
+fm_backend_source herdr || {
+  echo 'fm-herdr-linear-reconcile: Herdr backend support is unavailable; this Herdr-specific check cannot run' >&2
+  exit 1
+}
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/fm-herdr-linear-reconcile.XXXXXX") || exit 1
+trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+
+meta_value() { # <meta> <key>
+  fm_meta_get "$1" "$2"
+}
+
+safe_field() { # metadata values become TSV fields
+  case "$1" in *$'\t'*|*$'\n'*|*$'\r'*) return 1 ;; esac
+}
+
+# local_inventory writes a compact, home-owned inventory. The only live lookup
+# is an exact Herdr agent get for each recorded Herdr endpoint, not a global
+# pane list or a title/order heuristic.
+local_inventory() {
+  local rows="$TMP/local.rows" meta id kind backend endpoint card session pane pr response status
+  : > "$rows"
+  for meta in "$STATE"/*.meta; do
+    [ -f "$meta" ] && [ ! -L "$meta" ] || continue
+    id=${meta##*/}; id=${id%.meta}
+    kind=$(meta_value "$meta" kind)
+    [ "$kind" = secondmate ] && continue
+    backend=$(fm_backend_of_meta "$meta")
+    endpoint=$(fm_backend_target_of_meta "$meta")
+    card=$(meta_value "$meta" linear_card_id)
+    pr=$(meta_value "$meta" pr)
+    session=$(meta_value "$meta" herdr_session)
+    pane=$(meta_value "$meta" herdr_pane_id)
+    status=not-applicable
+    if [ "$backend" = herdr ]; then
+      if [ -z "$session" ] || [ -z "$pane" ] || [ "$endpoint" != "$session:$pane" ]; then
+        status=unreadable
+      else
+        response=$(fm_backend_herdr_cli "$session" agent get "$pane" 2>/dev/null || true)
+        if printf '%s' "$response" | jq -e '.result.agent | type == "object"' >/dev/null 2>&1; then
+          status=$(printf '%s' "$response" | jq -r '.result.agent.agent_status // "unknown"' 2>/dev/null || printf unknown)
+          case "$status" in working|idle|done|blocked) : ;; *) status=unknown ;; esac
+        elif printf '%s' "$response" | jq -e '.error.code? == "agent_not_found" or .error.code? == "pane_not_found"' >/dev/null 2>&1; then
+          status=missing
+        else
+          status=unreadable
+        fi
+      fi
+    fi
+    for value in "$id" "$card" "$backend" "$endpoint" "$session" "$pane" "$pr" "$status"; do
+      safe_field "$value" || {
+        echo "fm-herdr-linear-reconcile: unsafe metadata field for task $id" >&2
+        exit 1
+      }
+    done
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$id" "$card" "$backend" "$endpoint" "$session" "$pane" "$pr" "$status" >> "$rows"
+  done
+  jq -Rn --arg home "$FM_HOME" '
+    [inputs
+     | split("\t")
+     | select(length == 8)
+     | {task_id:.[0], linear_card_id:.[1], backend:.[2], endpoint:.[3],
+        herdr_session:.[4], herdr_pane_id:.[5], pr:.[6], endpoint_status:.[7]}]
+    | sort_by(.task_id)
+    | {schema:"fm-herdr-linear-inventory.v1", home:$home, children:.}
+  ' < "$rows"
+}
+
+LOCAL=$(local_inventory) || exit $?
+printf '%s\n' "$LOCAL" > "$TMP/local.json"
+
+if [ "$MODE" = inventory ]; then
+  if [ "$JSON_ONLY" = 0 ]; then
+    count=$(printf '%s' "$LOCAL" | jq '.children | length')
+    printf 'Herdr inventory: %s direct child lane(s).\n' "$count"
+  fi
+  printf '%s\n' "$LOCAL"
+  exit 0
+fi
+
+load_cards() {
+  local raw=$1
+  [ -f "$raw" ] && [ ! -L "$raw" ] || {
+    echo "fm-herdr-linear-reconcile: Linear input is unavailable at $raw" >&2
+    return 1
+  }
+  jq -e '
+    if (.cards | type) == "array" then .cards
+    elif (.data.issues.nodes | type) == "array" then .data.issues.nodes
+    else error("expected cards[] or data.issues.nodes[]") end
+    | map({id:(.id // ""), identifier:(.identifier // ""),
+           state:(if (.state | type) == "object" then (.state.name // "") else (.state // "") end)})
+    | if all(.[]; (.id | type) == "string" and length > 0 and (.identifier | type) == "string" and length > 0 and (.state | type) == "string")
+      then . else error("a card is missing id, identifier, or state") end
+    | map(select(.state == "In Progress" or .state == "In Review"))
+    | sort_by(.id, .identifier)
+  ' "$raw" > "$TMP/cards.json" || {
+    echo 'fm-herdr-linear-reconcile: Linear input is invalid' >&2
+    return 1
+  }
+}
+
+if [ "$LINEAR_API" = 1 ]; then
+  command -v curl >/dev/null 2>&1 || {
+    echo 'fm-herdr-linear-reconcile: curl is required for --linear-api' >&2
+    exit 1
+  }
+  : "${LINEAR_API_KEY:?fm-herdr-linear-reconcile: LINEAR_API_KEY is required for --linear-api}"
+  : "${FM_LINEAR_OPERATING_STUDIO_TEAM_ID:?fm-herdr-linear-reconcile: FM_LINEAR_OPERATING_STUDIO_TEAM_ID is required for --linear-api}"
+  payload=$(jq -cn --arg team "$FM_LINEAR_OPERATING_STUDIO_TEAM_ID" '{query:"query OperatingStudioCards($team: ID!) { issues(first: 250, filter: { team: { id: { eq: $team } }, state: { name: { in: [\"In Progress\", \"In Review\"] } } }) { nodes { id identifier state { name } } } }",variables:{team:$team}}')
+  if ! curl --fail --silent --show-error --max-time 15 \
+    -H 'Content-Type: application/json' -H "Authorization: $LINEAR_API_KEY" \
+    --data "$payload" https://api.linear.app/graphql > "$TMP/linear-api.json"; then
+    echo 'fm-herdr-linear-reconcile: Linear API request failed' >&2
+    exit 1
+  fi
+  if jq -e '.errors | type == "array" and length > 0' "$TMP/linear-api.json" >/dev/null 2>&1; then
+    echo 'fm-herdr-linear-reconcile: Linear API returned an error' >&2
+    exit 1
+  fi
+  load_cards "$TMP/linear-api.json" || exit 1
+else
+  load_cards "$CARDS_FILE" || exit 1
+fi
+
+if [ -n "$ZEUS_INVENTORY" ]; then
+  [ -f "$ZEUS_INVENTORY" ] && [ ! -L "$ZEUS_INVENTORY" ] || {
+    echo "fm-herdr-linear-reconcile: Zeus inventory is unavailable at $ZEUS_INVENTORY" >&2
+    exit 1
+  }
+  jq -e '
+    .schema == "fm-herdr-linear-inventory.v1"
+    and (.children | type) == "array"
+    and all(.children[]?; (.task_id | type) == "string" and (.endpoint_status | type) == "string")
+  ' "$ZEUS_INVENTORY" >/dev/null 2>&1 || {
+    echo 'fm-herdr-linear-reconcile: Zeus inventory is invalid' >&2
+    exit 1
+  }
+  cp "$ZEUS_INVENTORY" "$TMP/zeus.json"
+else
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":null,"children":[]}' > "$TMP/zeus.json"
+fi
+
+REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.json" --slurpfile cards "$TMP/cards.json" '
+  ($local[0].children + $zeus[0].children) as $workers
+  | $cards[0] as $cards
+  | [ $workers[] | select(.endpoint != "")
+      | {endpoint, task_id} ]
+    | group_by(.endpoint)
+    | map(select(length > 1) | {endpoint:.[0].endpoint, task_ids:map(.task_id)}) as $duplicate_endpoints
+  | [ $cards[] | .id ] | group_by(.) | map(select(length > 1) | .[0]) as $duplicate_cards
+  | [ $cards[] as $card
+      | ([ $workers[] | select(.linear_card_id == $card.id) ]) as $bound
+      | if ($duplicate_cards | index($card.id)) then
+          {kind:"duplicate-card", card_id:$card.id, identifier:$card.identifier,
+           detail:"Linear returned the same card identity more than once"}
+        elif ($bound | length) == 0 then
+          {kind:"card-without-task-binding", card_id:$card.id, identifier:$card.identifier,
+           detail:"no recorded Firstmate task binding"}
+        elif ($bound | length) > 1 then
+          {kind:"duplicate-ownership", card_id:$card.id, identifier:$card.identifier,
+           task_ids:($bound | map(.task_id)), detail:"multiple tasks claim this card"}
+        else $bound[0] as $worker
+          | if ($duplicate_endpoints | map(.task_ids | index($worker.task_id)) | any) then
+              {kind:"duplicate-endpoint", card_id:$card.id, identifier:$card.identifier,
+               task_id:$worker.task_id, endpoint:$worker.endpoint,
+               detail:"the recorded endpoint belongs to multiple tasks"}
+            elif $worker.backend != "herdr" then
+              {kind:"needs-deep-check", card_id:$card.id, identifier:$card.identifier,
+               task_id:$worker.task_id, detail:"the recorded task is not Herdr-backed"}
+            elif $worker.endpoint_status == "missing" then
+              {kind:"missing-endpoint", card_id:$card.id, identifier:$card.identifier,
+               task_id:$worker.task_id, endpoint:$worker.endpoint,
+               detail:"Herdr has no agent for the recorded endpoint"}
+            elif $worker.endpoint_status != "working" then
+              {kind:"needs-deep-check", card_id:$card.id, identifier:$card.identifier,
+               task_id:$worker.task_id, endpoint:$worker.endpoint,
+               detail:("Herdr cannot prove productive work (agent status " + $worker.endpoint_status + ")")}
+            elif $card.state == "In Review" and ($worker.pr | length) == 0 then
+              {kind:"board-column-mismatch-needs-pr-review", card_id:$card.id, identifier:$card.identifier,
+               task_id:$worker.task_id, endpoint:$worker.endpoint,
+               detail:"In Review has no recorded pull request; inspect PR state"}
+            elif $card.state == "In Progress" and ($worker.pr | length) > 0 then
+              {kind:"board-column-mismatch-needs-pr-review", card_id:$card.id, identifier:$card.identifier,
+               task_id:$worker.task_id, endpoint:$worker.endpoint,
+               detail:"In Progress has a recorded pull request; inspect PR state"}
+            else
+              {kind:"matched-live-endpoint", card_id:$card.id, identifier:$card.identifier,
+               task_id:$worker.task_id, endpoint:$worker.endpoint,
+               detail:"recorded Herdr endpoint is working"}
+            end
+        end
+    ] as $card_findings
+  | [ $workers[] as $worker
+      | select(($worker.linear_card_id | length) == 0 or ([ $cards[] | select(.id == $worker.linear_card_id) ] | length) == 0)
+      | {kind:"worker-without-applicable-card", task_id:$worker.task_id,
+         endpoint:$worker.endpoint, detail:"worker does not have an applicable In Progress or In Review card"}
+    ] as $worker_findings
+  | {schema:"fm-herdr-linear-reconcile.v1", local_inventory:$local[0], zeus_inventory:$zeus[0],
+     cards:$cards,
+     findings:(($card_findings + $worker_findings) | sort_by(.kind, (.card_id // ""), (.task_id // ""))),
+     summary:{cards:($cards | length), workers:($workers | length),
+              matched:([$card_findings[] | select(.kind == "matched-live-endpoint")] | length),
+              needs_deep_check:([($card_findings + $worker_findings)[] | select(.kind != "matched-live-endpoint")] | length)}}
+')
+
+if [ "$JSON_ONLY" = 0 ]; then
+  printf 'Operating Studio reconciliation: %s card(s), %s worker(s), %s matched, %s need inspection.\n' \
+    "$(printf '%s' "$REPORT" | jq -r '.summary.cards')" \
+    "$(printf '%s' "$REPORT" | jq -r '.summary.workers')" \
+    "$(printf '%s' "$REPORT" | jq -r '.summary.matched')" \
+    "$(printf '%s' "$REPORT" | jq -r '.summary.needs_deep_check')"
+fi
+printf '%s\n' "$REPORT"

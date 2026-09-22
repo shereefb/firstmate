@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--linear-card-id <id>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--linear-card-id <id>]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
@@ -67,6 +67,10 @@
 #   from that harness's launch rather than guessed. Ultra is the explicit
 #   exception: bin/fm-harness.sh validate-native-effort owns its model scope;
 #   supported Pi launches receive --codex-effort ultra, never --thinking ultra.
+#   --linear-card-id <id> records the immutable Linear issue id that owns this
+#   task. It is an identity binding for the read-only Operating Studio
+#   reconciliation, never a title or order heuristic. It is refused for
+#   secondmates and relaunches preserve the existing binding.
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   exact task only (docs/configuration.md "Runtime backend" owns when that flag
 #   is authorized). Without it, the script resolves FM_BACKEND, then
@@ -571,6 +575,7 @@ BACKEND_ARG=
 MODE=
 YOLO=
 TRACEPARENT_ARG=
+LINEAR_CARD_ID=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
@@ -578,6 +583,7 @@ BACKEND_SET=0
 MODE_SET=0
 YOLO_SET=0
 TRACEPARENT_SET=0
+LINEAR_CARD_ID_SET=0
 RELAUNCH=0
 POS=()
 want_value=
@@ -617,6 +623,10 @@ for a in "$@"; do
     traceparent)
       TRACEPARENT_ARG=$a
       TRACEPARENT_SET=1
+      ;;
+    linear-card-id)
+      LINEAR_CARD_ID=$a
+      LINEAR_CARD_ID_SET=1
       ;;
     *)
       echo "error: internal parser state for --$want_value" >&2
@@ -671,6 +681,11 @@ for a in "$@"; do
     TRACEPARENT_ARG=${a#--traceparent=}
     TRACEPARENT_SET=1
     ;;
+  --linear-card-id) want_value=linear-card-id ;;
+  --linear-card-id=*)
+    LINEAR_CARD_ID=${a#--linear-card-id=}
+    LINEAR_CARD_ID_SET=1
+    ;;
   *) POS+=("$a") ;;
   esac
 done
@@ -705,6 +720,13 @@ done
 [ "$TRACEPARENT_SET" -eq 0 ] || [ -n "$TRACEPARENT_ARG" ] || {
   echo "error: --traceparent requires a non-empty value" >&2
   exit 1
+}
+[ "$LINEAR_CARD_ID_SET" -eq 0 ] || {
+  case "$LINEAR_CARD_ID" in ''|*$'\n'*|*$'\r'*|*$'\t'*)
+    echo "error: --linear-card-id requires one non-empty single-line value" >&2
+    exit 1
+    ;;
+  esac
 }
 # A parent-delivered carrier replaces this home's own resolution, so it is
 # refused unless it is a secondmate spawn carrying a strictly valid W3C value.
@@ -748,11 +770,19 @@ if [ "$RELAUNCH" -eq 1 ]; then
     echo "error: --relaunch reuses the task's recorded yolo posture; --yolo cannot override it" >&2
     exit 1
   }
+  [ "$LINEAR_CARD_ID_SET" -eq 0 ] || {
+    echo "error: --relaunch preserves the task's recorded Linear card binding; --linear-card-id cannot override it" >&2
+    exit 1
+  }
 else
   # Delivery contract (AGENTS.md section 7). A ship task's mode and yolo are
   # firstmate's per-task decision, so they are required and closed-set validated
   # here rather than resolved from the project registry. Scouts deliver a report
   # and record no delivery posture; secondmate spawns hardcode theirs.
+  [ "$KIND" != secondmate ] || [ "$LINEAR_CARD_ID_SET" -eq 0 ] || {
+    echo "error: --linear-card-id applies only to ship or scout spawns" >&2
+    exit 1
+  }
   if [ "$KIND" = ship ]; then
     [ "$MODE_SET" -eq 1 ] || {
       echo "error: ship spawns require --mode <no-mistakes|direct-PR|local-only>; resolve it at intake from the captain's instruction and the project's registered posture in data/projects.md" >&2
@@ -4472,6 +4502,7 @@ preserve_relaunch_meta() {
   echo "effort=${EFFORT:-default}"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   echo "spawn_gen=$SPAWN_GEN"
+  [ "$LINEAR_CARD_ID_SET" -eq 0 ] || echo "linear_card_id=$LINEAR_CARD_ID"
   # Default-off writes no traceparent= line.
   # backend= is written only for a non-default (non-tmux) backend, so the
   # default path's meta stays byte-identical (absent backend= means tmux;
