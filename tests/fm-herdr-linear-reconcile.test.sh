@@ -37,16 +37,22 @@ case "${1:-} ${2:-}" in
       fail) exit 1 ;;
       inherited) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-foreign","label":"firstmate"},{"workspace_id":"w-owned","label":"firstmate"}]}}' ;;
       projection) jq -cn --arg token "$FM_TEST_PROJECTION_TOKEN" '{result:{workspaces:[
+        {workspace_id:"w-owned",label:"firstmate"},
         {workspace_id:"w-parent",label:"firstmate"},
         {workspace_id:"w-projected",label:("└ projected · p:" + $token)}]}}' ;;
-      *) printf '%s\n' '{"result":{"workspaces":[]}}' ;;
+      moved) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-moved","label":"firstmate"}]}}' ;;
+      zeus) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-zeus","label":"firstmate"}]}}' ;;
+      zeus-moved) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-zeus-moved","label":"firstmate"}]}}' ;;
+      *) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"}]}}' ;;
     esac
     ;;
   'tab list')
     case "$mode:$workspace" in
       inherited:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"fm-buildboard"},{"tab_id":"t-unrecorded","label":"fm-unrecorded"}]}}' ;;
       inherited:w-foreign) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-foreign","label":"fm-foreign"}]}}' ;;
+      moved:w-moved) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-moved","label":"fm-buildboard"},{"tab_id":"t-moved-worker","label":"fm-moved-worker"}]}}' ;;
       zeus:w-zeus) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus","label":"fm-zeus"},{"tab_id":"t-zeus-worker","label":"fm-zeus-worker"}]}}' ;;
+      zeus-moved:w-zeus-moved) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus-moved","label":"fm-zeus"},{"tab_id":"t-zeus-worker","label":"fm-zeus-worker"}]}}' ;;
       projection:w-projected) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-projected","label":"fm-projected"}]}}' ;;
       *:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"fm-buildboard"}]}}' ;;
       *:w-zeus) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus","label":"fm-zeus"}]}}' ;;
@@ -57,7 +63,9 @@ case "${1:-} ${2:-}" in
     case "$mode:$workspace" in
       inherited:w-owned) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-launch"},{"pane_id":"p-unrecorded","tab_id":"t-unrecorded"}]}}' ;;
       inherited:w-foreign) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-foreign","tab_id":"t-foreign"}]}}' ;;
+      moved:w-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-moved"},{"pane_id":"p-moved-worker","tab_id":"t-moved-worker"}]}}' ;;
       zeus:w-zeus) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus","tab_id":"t-zeus"},{"pane_id":"p-zeus-worker","tab_id":"t-zeus-worker"}]}}' ;;
+      zeus-moved:w-zeus-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus","tab_id":"t-zeus-moved"},{"pane_id":"p-zeus-worker","tab_id":"t-zeus-worker"}]}}' ;;
       projection:w-projected) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-projected","tab_id":"t-projected"}]}}' ;;
       *:w-owned) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-launch"}]}}' ;;
       *:w-zeus) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus","tab_id":"t-zeus"}]}}' ;;
@@ -68,8 +76,20 @@ case "${1:-} ${2:-}" in
     [ "$mode" != fail ] || exit 1
     case "${3:-}" in
       p-missing) printf '%s\n' '{"error":{"code":"pane_not_found"}}' ;;
-      p-launch) printf '%s\n' '{"result":{"pane":{"pane_id":"p-launch","tab_id":"t-launch","workspace_id":"w-owned"}}}' ;;
-      p-zeus) printf '%s\n' '{"result":{"pane":{"pane_id":"p-zeus","tab_id":"t-zeus","workspace_id":"w-zeus"}}}' ;;
+      p-launch)
+        if [ "$mode" = moved ]; then
+          printf '%s\n' '{"result":{"pane":{"pane_id":"p-launch","tab_id":"t-moved","workspace_id":"w-moved"}}}'
+        else
+          printf '%s\n' '{"result":{"pane":{"pane_id":"p-launch","tab_id":"t-launch","workspace_id":"w-owned"}}}'
+        fi
+        ;;
+      p-zeus)
+        if [ "$mode" = zeus-moved ]; then
+          printf '%s\n' '{"result":{"pane":{"pane_id":"p-zeus","tab_id":"t-zeus-moved","workspace_id":"w-zeus-moved"}}}'
+        else
+          printf '%s\n' '{"result":{"pane":{"pane_id":"p-zeus","tab_id":"t-zeus","workspace_id":"w-zeus"}}}'
+        fi
+        ;;
       *) printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "${3:-}" ;;
     esac
     ;;
@@ -82,7 +102,7 @@ case "${1:-} ${2:-}" in
     ;;
   'agent get')
     case "${3:-}" in
-      p-launch|p-zeus|p-zeus-worker|p-working|p-review|p-shared|p-stale|p-unrecorded|p-foreign|p-projected) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
+      p-launch|p-zeus|p-zeus-worker|p-working|p-review|p-shared|p-stale|p-unrecorded|p-foreign|p-projected|p-moved-worker) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
       p-idle) printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}' ;;
       *) printf '%s\n' '{"error":{"code":"agent_not_found"}}' ;;
     esac
@@ -307,6 +327,18 @@ test_exact_live_worker_ownership_is_discovered() {
     and ([.local_inventory.children[] | select(.task_id == "foreign")] | length) == 0
   ' >/dev/null || fail "exact inherited workspace ownership was not enforced: $out"
 
+  dir=$(make_case moved-owner)
+  cards="$dir/cards.json"
+  printf '%s\n' '{"cards":[]}' > "$cards"
+  out=$(FM_TEST_HERDR_DISCOVERY=moved run_reconcile "$dir" "$cards") \
+    || fail "moved owner live worker discovery failed"
+  printf '%s' "$out" | jq -e '
+    .summary.workers == 1
+    and .local_inventory.children[0].task_id == "moved-worker"
+    and .local_inventory.children[0].endpoint == "jarvis:p-moved-worker"
+    and .local_inventory.children[0].endpoint_status == "alive"
+  ' >/dev/null || fail "moved owner workspace was not resolved from its live endpoint: $out"
+
   dir=$(make_case projected-worker)
   cards="$dir/cards.json"
   token=abcdefghijklmnopqrstuv
@@ -365,7 +397,7 @@ route=remote
 parent_host=jarvis-host
 EOF
   write_owner_meta "$remote/state/parent-route/zeus.meta" zeus "$remote" jarvis w-zeus t-zeus p-zeus
-  out=$(FM_TEST_HERDR_DISCOVERY=zeus \
+  out=$(FM_TEST_HERDR_DISCOVERY=zeus-moved \
     FM_TEST_AMBIENT_PANE=p-launch FM_TEST_AMBIENT_SESSION=jarvis \
     FM_TEST_AMBIENT_SOCKET=/tmp/herdr-jarvis.sock \
     run_inventory "$dir" "$remote") \
@@ -393,7 +425,7 @@ EOF
   write_owner_meta "$dir/home/state/zeus.meta" zeus "$zeus_home" jarvis w-zeus t-zeus p-zeus
   printf '%s\n' "- zeus - Operating Studio delivery (home: $zeus_home; scope: Operating Studio delivery; projects: operating-studio; added 2026-09-22)" > "$dir/home/data/secondmates.md"
   printf '%s\n' '{"cards":[]}' > "$cards"
-  out=$(FM_TEST_HERDR_DISCOVERY=zeus run_reconcile "$dir" "$cards") \
+  out=$(FM_TEST_HERDR_DISCOVERY=zeus-moved run_reconcile "$dir" "$cards") \
     || fail "local registered Zeus inventory failed"
   printf '%s' "$out" | jq -e --arg home "$zeus_home" '
     .summary.workers == 1

@@ -130,7 +130,8 @@ append_live_worker() { # <rows> <task-id> <session> <pane>
 
 resolve_inventory_owner() {
   local marker="$FM_HOME/.fm-secondmate-home" parent="$FM_HOME/.fm-secondmate-parent"
-  local owner meta recorded_home canonical_home canonical_recorded status pane_out tab_out
+  local owner meta recorded_home canonical_home canonical_recorded status pane_out owner_location
+  local workspaces_out tabs_out
   INVENTORY_OWNER_ID=
   INVENTORY_OWNER_SESSION=
   INVENTORY_OWNER_WORKSPACE=
@@ -156,36 +157,41 @@ resolve_inventory_owner() {
     [ "$FM_BACKEND_VALIDATED_BACKEND" = herdr ] || return 1
     INVENTORY_OWNER_ID=$owner
     INVENTORY_OWNER_SESSION=$(meta_value "$meta" herdr_session)
-    INVENTORY_OWNER_WORKSPACE=$(meta_value "$meta" herdr_workspace_id)
-    INVENTORY_OWNER_TAB=$(meta_value "$meta" herdr_tab_id)
     INVENTORY_OWNER_PANE=$(meta_value "$meta" herdr_pane_id)
     [ "$FM_BACKEND_VALIDATED_TARGET" = "$INVENTORY_OWNER_SESSION:$INVENTORY_OWNER_PANE" ] \
-      && [ -n "$INVENTORY_OWNER_WORKSPACE" ] && [ -n "$INVENTORY_OWNER_TAB" ] || return 1
+      || return 1
   else
     INVENTORY_OWNER_SESSION=$(fm_backend_herdr_session)
     fm_backend_herdr_launcher_identity "$INVENTORY_OWNER_SESSION" && status=0 || status=$?
     [ "$status" -eq 0 ] || return 1
-    INVENTORY_OWNER_WORKSPACE=$FM_BACKEND_HERDR_LAUNCHER_WORKSPACE_ID
-    INVENTORY_OWNER_TAB=$FM_BACKEND_HERDR_LAUNCHER_TAB_ID
     INVENTORY_OWNER_PANE=$FM_BACKEND_HERDR_LAUNCHER_PANE_ID
   fi
   [ "$(fm_backend_agent_state herdr "$INVENTORY_OWNER_SESSION:$INVENTORY_OWNER_PANE")" = alive ] \
     || return 1
   pane_out=$(fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" pane get "$INVENTORY_OWNER_PANE" 2>/dev/null) \
     || return 1
-  printf '%s' "$pane_out" | jq -e \
-    --arg pane "$INVENTORY_OWNER_PANE" --arg tab "$INVENTORY_OWNER_TAB" \
-    --arg workspace "$INVENTORY_OWNER_WORKSPACE" '
-      .result.pane.pane_id == $pane
-      and .result.pane.tab_id == $tab
-      and .result.pane.workspace_id == $workspace
-    ' >/dev/null 2>&1 || return 1
-  tab_out=$(fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" tab get "$INVENTORY_OWNER_TAB" 2>/dev/null) \
+  owner_location=$(printf '%s' "$pane_out" | jq -er --arg pane "$INVENTORY_OWNER_PANE" '
+    .result.pane
+    | select(.pane_id == $pane)
+    | select((.workspace_id | type) == "string" and (.workspace_id | length) > 0)
+    | select((.tab_id | type) == "string" and (.tab_id | length) > 0)
+    | [.workspace_id, .tab_id]
+    | @tsv
+  ') || return 1
+  IFS=$'\t' read -r INVENTORY_OWNER_WORKSPACE INVENTORY_OWNER_TAB <<< "$owner_location"
+  [ -n "$INVENTORY_OWNER_WORKSPACE" ] && [ -n "$INVENTORY_OWNER_TAB" ] || return 1
+  workspaces_out=$(fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" workspace list 2>/dev/null) \
     || return 1
-  printf '%s' "$tab_out" | jq -e \
-    --arg tab "$INVENTORY_OWNER_TAB" --arg workspace "$INVENTORY_OWNER_WORKSPACE" '
-      .result.tab.tab_id == $tab and .result.tab.workspace_id == $workspace
-    ' >/dev/null 2>&1
+  printf '%s' "$workspaces_out" | jq -e --arg workspace "$INVENTORY_OWNER_WORKSPACE" '
+    (.result.workspaces | type) == "array"
+    and ([.result.workspaces[] | select(.workspace_id == $workspace)] | length) == 1
+  ' >/dev/null 2>&1 || return 1
+  tabs_out=$(fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" tab list \
+    --workspace "$INVENTORY_OWNER_WORKSPACE" 2>/dev/null) || return 1
+  printf '%s' "$tabs_out" | jq -e --arg tab "$INVENTORY_OWNER_TAB" '
+    (.result.tabs | type) == "array"
+    and ([.result.tabs[] | select(.tab_id == $tab)] | length) == 1
+  ' >/dev/null 2>&1
 }
 
 discover_owned_flat_workers() { # <rows>
