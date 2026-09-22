@@ -900,16 +900,25 @@ test_ship_and_scout_teach_validation_round_pause() {
   pass "fm-brief.sh: ship and scout scaffolds teach validation-round pauses"
 }
 
+# The generated brief's own top-level headings are the structure fm-brief.sh
+# owns, so they are the anchor for asking which block an instruction landed in.
+# Prints the named section's body, stopping at the next top-level heading.
+brief_section() {  # <heading> <brief>
+  awk -v h="$1" '$0 == h { inside = 1; next } /^# / { inside = 0 } inside' "$2"
+}
+
+# The wait declaration must sit at each point of use, not merely somewhere in
+# the brief: inside the no-mistakes Definition of done right after the
+# background-and-poll paragraph the worker rereads when it starts polling, and
+# inside the scout rules block where a scout settles into a long run. Asserting
+# the owning section is what catches a relocation back into a shared rule 4,
+# which a whole-file count cannot see.
 test_wait_declaration_instruction_placement() {
-  local home kind id brief verb rc declarations
+  local home kind id brief verb rc declarations tpl dod poll_at decl_at
   local -a args
   home="$TMP_ROOT/wait-declaration-home"
   mkdir -p "$home/data"
 
-  # The wait declaration belongs at each point of use: the no-mistakes
-  # Definition of done, where the worker backgrounds the drive call and polls,
-  # and the scout rules block, where a scout settles into a long run. The
-  # secondmate charter supervises rather than polls and carries none.
   for verb in "" awaiting; do
     for kind in ship:no-mistakes scout secondmate; do
       id="wait-declaration-${kind//:/-}${verb:+-$verb}"
@@ -926,20 +935,35 @@ test_wait_declaration_instruction_placement() {
       assert_present "$brief" \
         "$kind scaffold (pause verb ${verb:-default}) wrote no brief to $brief"
 
-      declarations=$(grep -c -F -- '[at=<epoch>]: {what you are waiting for}' "$brief")
+      tpl="\`${verb:-paused} [at=<epoch>]: {what you are waiting for}\`"
+      declarations=$(grep -c -F -- "$tpl" "$brief")
       if [ "$kind" = secondmate ]; then
         [ "$declarations" = 0 ] || fail \
-          "secondmate charter renders $declarations wait-declaration templates; it must render none"
+          "secondmate charter renders $declarations wait declarations; it must render none"
         continue
       fi
       [ "$declarations" = 1 ] || fail \
-        "$kind brief renders $declarations wait-declaration templates; its point of use must carry one"
-      # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-      assert_grep "\`${verb:-paused} [at=<epoch>]: {what you are waiting for}\`" \
-        "$brief" "$kind brief did not render the configured pause verb and stamp in its wait declaration"
+        "$kind brief renders $declarations wait declarations in the configured verb; expected exactly one"
+
+      case "$kind" in
+        ship:no-mistakes)
+          dod=$(brief_section '# Definition of done' "$brief")
+          printf '%s\n' "$dod" | grep -qF -- "$tpl" || fail \
+            "$kind brief does not declare the wait in its Definition of done, where the worker polls"
+          poll_at=$(printf '%s\n' "$dod" | grep -n -F -- 'background the drive call and poll' | cut -d: -f1 | head -1)
+          decl_at=$(printf '%s\n' "$dod" | grep -n -F -- "$tpl" | cut -d: -f1 | head -1)
+          [ -n "$poll_at" ] || fail "$kind Definition of done no longer tells the worker to background and poll"
+          [ "$decl_at" -gt "$poll_at" ] && [ $((decl_at - poll_at)) -le 3 ] || fail \
+            "$kind brief declares the wait $((decl_at - poll_at)) lines from the background-and-poll paragraph, not at it"
+          ;;
+        scout)
+          printf '%s\n' "$(brief_section '# Rules' "$brief")" | grep -qF -- "$tpl" || fail \
+            "$kind brief does not declare the wait in its rules block, where a scout settles into a long run"
+          ;;
+      esac
     done
   done
-  pass "fm-brief.sh: the wait declaration sits at each point of use in the configured verb"
+  pass "fm-brief.sh: the wait declaration sits in the block that is its point of use"
 }
 
 test_scout_and_secondmate_load_decision_hold_policy() {
