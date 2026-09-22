@@ -226,7 +226,7 @@ The primary runs `--linear-api` with `LINEAR_API_KEY`, `FM_LINEAR_OPERATING_STUD
 Comparison resolves the `zeus` secondmate through the primary home's `data/secondmates.md` and obtains a fresh inventory from the registered local home or through its registered `fm-on.sh` route.
 The primary rejects an unavailable route, invalid returned inventory, or returned home that differs from the registered home.
 API mode refuses to run without both identities, filters by both, and reads every result page.
-The report names exact identity, duplicate, endpoint, and board-review discrepancies as well as `needs-deep-check` results; use the existing crew-state, validation, PR, and targeted pane checks to settle those results.
+The command always emits one JSON object that names exact identity, count, duplicate, and endpoint discrepancies as well as `needs-deep-check` results.
 No scheduler is installed: a heartbeat or check owner may consume this report only after it owns Linear credentials and the registered Zeus route.
 `tests/fm-herdr-linear-reconcile.test.sh` covers the portable behavior.
 

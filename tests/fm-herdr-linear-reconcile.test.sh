@@ -105,15 +105,14 @@ SH
   chmod +x "$dir/bin/curl"
 }
 
-write_meta() { # <home> <task> <pane> <card-id> [<pr>]
-  local home=$1 task=$2 pane=$3 card=$4 pr=${5:-}
+write_meta() { # <home> <task> <pane> <card-id>
+  local home=$1 task=$2 pane=$3 card=$4
   {
     printf 'backend=herdr\n'
     printf 'window=jarvis:%s\n' "$pane"
     printf 'herdr_session=jarvis\n'
     printf 'herdr_pane_id=%s\n' "$pane"
     [ -z "$card" ] || printf 'linear_card_id=%s\n' "$card"
-    [ -z "$pr" ] || printf 'pr=%s\n' "$pr"
   } > "$home/state/$task.meta"
 }
 
@@ -125,7 +124,7 @@ run_reconcile() { # <case-dir> <cards>
     FM_TEST_LINEAR_CARDS_FILE="$cards" LINEAR_API_KEY=secret \
     FM_LINEAR_OPERATING_STUDIO_TEAM_ID=team-os \
     FM_LINEAR_OPERATING_STUDIO_PROJECT_ID=project-os \
-    "$SCRIPT" --linear-api --json
+    "$SCRIPT" --linear-api
 }
 
 test_equal_count_wrong_identity() {
@@ -148,7 +147,7 @@ test_remote_inventory_is_fetched_live() {
   zeus="$dir/zeus-live.json"
   printf '%s\n' '{"cards":[{"id":"card-zeus","identifier":"OS-9","state":"In Progress"}]}' > "$cards"
   cat > "$zeus" <<'JSON'
-{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"zeus-worker","linear_card_id":"card-zeus","backend":"herdr","endpoint":"zeus:p9","herdr_session":"zeus","herdr_pane_id":"p9","pr":"","endpoint_status":"alive"}]}
+{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"zeus-worker","linear_card_id":"card-zeus","backend":"herdr","endpoint":"zeus:p9","herdr_session":"zeus","herdr_pane_id":"p9","endpoint_status":"alive"}]}
 JSON
   out=$(run_reconcile "$dir" "$cards") || fail "remote inventory reconciliation failed"
   printf '%s' "$out" | jq -e '
@@ -221,7 +220,7 @@ test_live_remote_inventory_requires_complete_schema() {
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "incomplete Zeus child was accepted"
   case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "incomplete Zeus diagnostic drifted: $out" ;; esac
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p1","herdr_session":"zeus","herdr_pane_id":"p1","pr":"","endpoint_status":"working"}]}' > "$zeus"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p1","herdr_session":"zeus","herdr_pane_id":"p1","endpoint_status":"working"}]}' > "$zeus"
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "unknown Zeus endpoint status was accepted"
   case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "unknown Zeus status diagnostic drifted: $out" ;; esac
@@ -243,7 +242,7 @@ test_linear_api_requires_project_and_reads_all_pages() {
     FM_LINEAR_OPERATING_STUDIO_TEAM_ID=team-os \
     FM_SSH_BIN="$dir/bin/fake-ssh" FM_TEST_ZEUS_LIVE_INVENTORY="$dir/zeus-live.json" \
     FM_TEST_ZEUS_SSH_COUNT="$dir/zeus-ssh.count" \
-    "$SCRIPT" --linear-api --json 2>&1) && rc=0 || rc=$?
+    "$SCRIPT" --linear-api 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "Linear API ran without an Operating Studio project id"
   case "$out" in *'FM_LINEAR_OPERATING_STUDIO_PROJECT_ID is required'*) ;; *) fail "missing project diagnostic drifted: $out" ;; esac
 
@@ -253,7 +252,7 @@ test_linear_api_requires_project_and_reads_all_pages() {
     FM_LINEAR_OPERATING_STUDIO_PROJECT_ID=project-os \
     FM_SSH_BIN="$dir/bin/fake-ssh" FM_TEST_ZEUS_LIVE_INVENTORY="$dir/zeus-live.json" \
     FM_TEST_ZEUS_SSH_COUNT="$dir/zeus-ssh.count" \
-    "$SCRIPT" --linear-api --json) \
+    "$SCRIPT" --linear-api) \
     || fail "paginated Linear API reconciliation failed"
   printf '%s' "$out" | jq -e '
     .summary.cards == 2
@@ -284,7 +283,7 @@ test_duplicate_ownership_and_endpoint_are_not_coverage() {
   pass "duplicate card ownership and endpoints do not count as coverage"
 }
 
-test_unrelated_worker_missing_endpoint_and_review_mismatch() {
+test_unrelated_worker_and_missing_endpoint() {
   local dir cards out
   dir=$(make_case discrepancies)
   write_meta "$dir/home" working p-working card-working
@@ -295,9 +294,9 @@ test_unrelated_worker_missing_endpoint_and_review_mismatch() {
   printf '%s\n' '{"cards":[{"id":"card-working","identifier":"OS-1","state":"In Progress"},{"id":"card-missing","identifier":"OS-2","state":"In Progress"},{"id":"card-review","identifier":"OS-3","state":"In Review"}]}' > "$cards"
   out=$(run_reconcile "$dir" "$cards") || fail "discrepancy reconciliation failed"
   printf '%s' "$out" | jq -e '
-    ([.findings[].kind] | sort) == ["board-column-mismatch-needs-pr-review", "matched-live-endpoint", "missing-endpoint", "worker-without-applicable-card"]
-  ' >/dev/null || fail "unrelated, missing, or review mismatch classification drifted: $out"
-  pass "unrelated workers, missing endpoints, and review mismatches remain visible"
+    ([.findings[].kind] | sort) == ["matched-live-endpoint", "matched-live-endpoint", "missing-endpoint", "worker-without-applicable-card"]
+  ' >/dev/null || fail "unrelated or missing endpoint classification drifted: $out"
+  pass "unrelated workers and missing endpoints remain visible"
 }
 
 test_non_applicable_columns_do_not_cover_workers() {
@@ -318,22 +317,25 @@ test_required_inputs_fail_clearly() {
   dir=$(make_case unavailable)
   cards="$dir/cards.json"
   printf '%s\n' '{"cards":[]}' > "$cards"
-  out=$(PATH="/usr/bin:/bin" FM_HOME="$dir/home" "$SCRIPT" --linear-api --json 2>&1) && rc=0 || rc=$?
+  out=$(PATH="/usr/bin:/bin" FM_HOME="$dir/home" "$SCRIPT" --linear-api 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "missing Herdr succeeded"
   case "$out" in *'Herdr is unavailable'*) ;; *) fail "missing Herdr diagnostic was unclear: $out" ;; esac
 
   printf '%s\n' '- other - Other delivery (host: zeus-host; root: /remote/firstmate; home: /remote/other-home; scope: Other delivery; projects: other; added 2026-09-22)' > "$dir/home/data/secondmates.md"
-  out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --linear-api --json 2>&1) && rc=0 || rc=$?
+  out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --linear-api 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "comparison without a registered Zeus route succeeded"
   case "$out" in *'Zeus route is unavailable'*) ;; *) fail "missing Zeus route diagnostic was unclear: $out" ;; esac
 
-  out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --zeus-inventory "$dir/zeus-live.json" --linear-api --json 2>&1) && rc=0 || rc=$?
+  out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --zeus-inventory "$dir/zeus-live.json" --linear-api 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "caller-supplied Zeus inventory succeeded"
   case "$out" in *'usage: fm-herdr-linear-reconcile.sh'*) ;; *) fail "removed Zeus inventory input did not return usage: $out" ;; esac
 
-  out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --cards "$cards" --linear-api --json 2>&1) && rc=0 || rc=$?
+  out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --cards "$cards" --linear-api 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "unscoped --cards input succeeded"
   case "$out" in *'usage: fm-herdr-linear-reconcile.sh'*) ;; *) fail "removed --cards mode did not return usage: $out" ;; esac
+  out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --linear-api --json 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "removed --json output mode succeeded"
+  case "$out" in *'usage: fm-herdr-linear-reconcile.sh'*) ;; *) fail "removed --json mode did not return usage: $out" ;; esac
   pass "comparison requires a registered Zeus route and rejects caller inputs"
 }
 
@@ -341,7 +343,7 @@ test_equal_count_wrong_identity
 test_remote_inventory_is_fetched_live
 test_local_registered_inventory_route_is_accepted
 test_duplicate_ownership_and_endpoint_are_not_coverage
-test_unrelated_worker_missing_endpoint_and_review_mismatch
+test_unrelated_worker_and_missing_endpoint
 test_non_applicable_columns_do_not_cover_workers
 test_process_liveness_outranks_recorded_agent_status
 test_empty_card_identities_are_rejected
