@@ -342,12 +342,21 @@ test_exact_live_worker_ownership_is_discovered() {
     || fail "moved owner live worker discovery failed"
   printf '%s' "$out" | jq -e '
     .summary.workers == 1
-    and .summary.needs_deep_check == 2
-    and .local_inventory.ownership_status == "needs-deep-check"
+    and .summary.needs_deep_check == 1
+    and .local_inventory.ownership_status == "verified"
     and .local_inventory.children[0].task_id == "moved-worker"
     and .local_inventory.children[0].endpoint == "jarvis:p-moved-worker"
     and .local_inventory.children[0].endpoint_status == "alive"
   ' >/dev/null || fail "moved owner workspace was not resolved from its live endpoint: $out"
+  write_meta "$dir/home" moved-worker p-moved-worker card-moved
+  printf '%s\n' '{"cards":[{"id":"card-moved","identifier":"OS-MOVED","state":"In Progress"}]}' > "$cards"
+  out=$(FM_TEST_HERDR_DISCOVERY=moved run_reconcile "$dir" "$cards") \
+    || fail "matching moved-owner reconciliation failed"
+  printf '%s' "$out" | jq -e '
+    .summary == {cards:1, workers:1, matched:1, needs_deep_check:0}
+    and .local_inventory.ownership_status == "verified"
+    and (.findings | map(.kind)) == ["matched-live-endpoint"]
+  ' >/dev/null || fail "an owner move created a discrepancy despite exact worker identity and count: $out"
 
   dir=$(make_case ambiguous-owner)
   cards="$dir/cards.json"
@@ -423,7 +432,7 @@ EOF
     run_inventory "$dir" "$remote") \
     || fail "remote home inventory could not resolve its host-local owner record"
   printf '%s' "$out" | jq -e '
-    .ownership_status == "needs-deep-check"
+    .ownership_status == "verified"
     and
     .children == [{task_id:"zeus-worker", linear_card_id:"", backend:"herdr",
       endpoint:"jarvis:p-zeus-worker", herdr_session:"jarvis",
@@ -451,10 +460,11 @@ EOF
     || fail "local registered Zeus inventory failed"
   printf '%s' "$out" | jq -e --arg home "$zeus_home" '
     .summary.workers == 1
-    and .zeus_inventory.ownership_status == "needs-deep-check"
+    and .summary.needs_deep_check == 1
+    and .zeus_inventory.ownership_status == "verified"
     and .zeus_inventory.home == $home
     and .zeus_inventory.children[0].task_id == "zeus-worker"
-    and ([.findings[] | select(.kind == "needs-deep-check" and .home == $home)] | length) == 1
+    and ([.findings[] | select(.kind == "needs-deep-check" and .home == $home)] | length) == 0
   ' >/dev/null || fail "local Zeus route was not preserved: $out"
   pass "local registered Zeus inventory route is accepted"
 }
@@ -531,6 +541,13 @@ test_live_remote_inventory_requires_complete_schema() {
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "another home was accepted as Zeus inventory"
   case "$out" in *'live Zeus inventory returned home'*) ;; *) fail "wrong Zeus owner diagnostic drifted: $out" ;; esac
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"needs-deep-check","children":[]}' > "$zeus"
+  out=$(run_reconcile "$dir" "$cards") || fail "unproven Zeus ownership inventory was rejected"
+  printf '%s' "$out" | jq -e '
+    .summary.needs_deep_check == 1
+    and .findings == [{kind:"needs-deep-check", home:"/remote/zeus-home",
+      detail:"worker ownership completeness is unproven"}]
+  ' >/dev/null || fail "unproven Zeus ownership did not trigger one deep check: $out"
   pass "live Zeus inventory requires its registered route and complete child schema"
 }
 

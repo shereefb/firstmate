@@ -6,8 +6,9 @@ set -u
 # shellcheck source=tests/herdr-test-safety.sh
 . "$ROOT/tests/herdr-test-safety.sh"
 
+command -v herdr >/dev/null 2>&1 || { echo "skip: herdr not found"; exit 0; }
+command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 herdr_forget_inherited_pane
-fm_live_gate default-on FM_HERDR_LINEAR_INVENTORY_LIVE_E2E herdr jq
 
 LAB_HELPER=${HERDR_LAB_HELPER:-$ROOT/bin/fm-herdr-lab.sh}
 [ -x "$LAB_HELPER" ] || { echo "skip: live: Herdr lab helper not executable at $LAB_HELPER"; exit 0; }
@@ -145,7 +146,7 @@ printf '%s' "$OUT" | jq -e \
   --arg old_child "$OLD_CHILD_PANE" \
   --arg projected "$PROJECTED_PANE" '
     .schema == "fm-herdr-linear-inventory.v1"
-    and .ownership_status == "needs-deep-check"
+    and .ownership_status == "verified"
     and (.children | length) == 2
     and any(.children[];
       .task_id == "old-child" and .herdr_session == $session

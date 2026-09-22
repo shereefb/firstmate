@@ -184,8 +184,6 @@ resolve_inventory_owner() {
   [ -n "$INVENTORY_OWNER_WORKSPACE" ] && [ -n "$INVENTORY_OWNER_TAB" ] || return 1
   if [ -z "$INVENTORY_OWNER_REGISTERED_WORKSPACE" ]; then
     INVENTORY_OWNER_REGISTERED_WORKSPACE=$INVENTORY_OWNER_WORKSPACE
-  elif [ "$INVENTORY_OWNER_REGISTERED_WORKSPACE" != "$INVENTORY_OWNER_WORKSPACE" ]; then
-    INVENTORY_OWNERSHIP_STATUS=needs-deep-check
   fi
   safe_field "$INVENTORY_OWNER_SESSION" \
     && safe_field "$INVENTORY_OWNER_REGISTERED_WORKSPACE" \
@@ -560,7 +558,7 @@ REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.j
   | [ $local[0], $zeus[0]
       | select(.ownership_status == "needs-deep-check")
       | {kind:"needs-deep-check", home:.home,
-         detail:"the registered owner moved workspaces, so unrecorded flat-worker ownership needs inspection"}
+         detail:"worker ownership completeness is unproven"}
     ] as $inventory_findings
   | {schema:"fm-herdr-linear-reconcile.v1", local_inventory:$local[0], zeus_inventory:$zeus[0],
      cards:$cards,
