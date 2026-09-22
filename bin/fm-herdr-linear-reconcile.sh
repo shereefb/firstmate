@@ -101,31 +101,21 @@ task_id_valid() {
   [ "${#1}" -le 64 ]
 }
 
-append_live_worker() { # <rows> <task-id> <session> <pane>
-  local rows=$1 task_id=$2 session=$3 pane=$4 endpoint status value
+append_worker_identity() { # <rows> <task-id> <session> <pane>
+  local rows=$1 task_id=$2 session=$3 pane=$4 endpoint value
   task_id_valid "$task_id" || {
     echo "fm-herdr-linear-reconcile: invalid live Herdr task identity $task_id" >&2
     return 1
   }
   endpoint="$session:$pane"
-  status=$(fm_backend_agent_state herdr "$endpoint")
-  case "$status" in
-    alive)
-      for value in "$task_id" "$endpoint" "$session" "$pane"; do
-        safe_field "$value" || {
-          echo "fm-herdr-linear-reconcile: unsafe live Herdr worker identity for task $task_id" >&2
-          return 1
-        }
-      done
-      printf '%s\t\therdr\t%s\t%s\t%s\talive\n' \
-        "$task_id" "$endpoint" "$session" "$pane" >> "$rows"
-      ;;
-    dead|missing) ;;
-    *)
-      echo "fm-herdr-linear-reconcile: could not verify Herdr worker $endpoint" >&2
+  for value in "$task_id" "$endpoint" "$session" "$pane"; do
+    safe_field "$value" || {
+      echo "fm-herdr-linear-reconcile: unsafe live Herdr worker identity for task $task_id" >&2
       return 1
-      ;;
-  esac
+    }
+  done
+  printf '%s\t\therdr\t%s\t%s\t%s\tpending\n' \
+    "$task_id" "$endpoint" "$session" "$pane" >> "$rows"
 }
 
 resolve_inventory_owner() {
@@ -137,7 +127,6 @@ resolve_inventory_owner() {
   INVENTORY_OWNER_WORKSPACE=
   INVENTORY_OWNER_TAB=
   INVENTORY_OWNER_PANE=
-  INVENTORY_OWNERSHIP_STATUS=verified
   if [ -e "$marker" ] || [ -L "$marker" ]; then
     [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
     owner=$(cat "$marker" 2>/dev/null) || return 1
@@ -256,7 +245,7 @@ discover_owned_flat_workers() { # <rows> <workspaces>
     fi
     while IFS=$'\t' read -r pane task_id; do
       [ -n "$pane" ] || continue
-      append_live_worker "$rows" "$task_id" "$session" "$pane" || return 1
+      append_worker_identity "$rows" "$task_id" "$session" "$pane" || return 1
     done < <(jq -r --slurpfile panes "$panes" --argjson owner_session "$owner_session" \
       --arg owner_pane "$INVENTORY_OWNER_PANE" '
       .result.tabs[]
@@ -302,7 +291,7 @@ discover_projected_workers() { # <rows> <workspaces>
     printf '%s\t%s\n' \
       "$FM_BACKEND_HERDR_JOURNAL_SESSION" \
       "$FM_BACKEND_HERDR_JOURNAL_PARENT_WORKSPACE_ID" >> "$workspaces"
-    append_live_worker "$rows" "$task_id" "$FM_BACKEND_HERDR_JOURNAL_SESSION" \
+    append_worker_identity "$rows" "$task_id" "$FM_BACKEND_HERDR_JOURNAL_SESSION" \
       "$FM_BACKEND_HERDR_JOURNAL_PANE_ID" || return 1
   done
 }
@@ -346,8 +335,7 @@ local_inventory() {
       if [ -z "$session" ] || [ -z "$pane" ] || [ "$endpoint" != "$session:$pane" ]; then
         status=unreadable
       else
-        status=$(fm_backend_agent_state "$backend" "$endpoint")
-        case "$status" in alive|dead|missing|ambiguous|unreadable|unverified) : ;; *) status=unreadable ;; esac
+        status=pending
       fi
     fi
     for value in "$id" "$card" "$backend" "$endpoint" "$session" "$pane" "$status"; do
@@ -374,16 +362,43 @@ local_inventory() {
      | {task_id:.[0], linear_card_id:.[1], backend:.[2], endpoint:.[3],
         herdr_session:.[4], herdr_pane_id:.[5], endpoint_status:.[6]}]
   ' < "$live_rows" > "$TMP/local-live.json"
-  jq -n --arg home "$FM_HOME" --arg ownership_status "$INVENTORY_OWNERSHIP_STATUS" \
-    --slurpfile records "$TMP/local-records.json" --slurpfile live "$TMP/local-live.json" '
-    ($records[0] + [ $live[0][] as $worker
+  jq -n --slurpfile records "$TMP/local-records.json" --slurpfile live "$TMP/local-live.json" '
+    (($records[0] | map(. + {recorded:true})) + [ $live[0][] as $worker
         | select(any($records[0][];
             .task_id == $worker.task_id and .backend == "herdr" and .endpoint == $worker.endpoint) | not)
-        | $worker ])
+        | $worker + {recorded:false} ])
+    | unique_by([.task_id, .backend, .endpoint])
+  ' > "$TMP/local-union.json"
+  jq -r '.[] | select(.backend == "herdr" and .endpoint_status == "pending") | .endpoint' \
+    "$TMP/local-union.json" | sort -u > "$TMP/local-endpoints"
+  : > "$TMP/local-status.rows"
+  while IFS= read -r endpoint; do
+    [ -n "$endpoint" ] || continue
+    status=$(fm_backend_agent_state herdr "$endpoint") || status=unreadable
+    case "$status" in alive|dead|missing|ambiguous|unreadable|unverified) : ;; *) status=unreadable ;; esac
+    safe_field "$endpoint" && safe_field "$status" || return 1
+    printf '%s\t%s\n' "$endpoint" "$status" >> "$TMP/local-status.rows"
+  done < "$TMP/local-endpoints"
+  jq -Rn '[inputs | split("\t") | select(length == 2) | {endpoint:.[0], status:.[1]}]' \
+    < "$TMP/local-status.rows" > "$TMP/local-status.json"
+  jq --slurpfile statuses "$TMP/local-status.json" '
+    map(if .endpoint_status == "pending" then
+      .endpoint as $endpoint
+      | .endpoint_status = ([ $statuses[0][] | select(.endpoint == $endpoint) | .status ][0] // "unreadable")
+    else . end)
+  ' "$TMP/local-union.json" > "$TMP/local-resolved.json"
+  if jq -e 'any(.[]; .recorded == false
+      and (.endpoint_status != "alive" and .endpoint_status != "dead" and .endpoint_status != "missing"))' \
+      "$TMP/local-resolved.json" >/dev/null; then
+    echo 'fm-herdr-linear-reconcile: could not verify a discovered Herdr worker' >&2
+    return 1
+  fi
+  jq --arg home "$FM_HOME" '
+    [ .[] | select(.recorded or .endpoint_status == "alive") | del(.recorded) ]
     | sort_by(.task_id, .backend, .endpoint)
     | {schema:"fm-herdr-linear-inventory.v1", home:$home,
-       ownership_status:$ownership_status, children:.}
-  '
+       ownership_status:"verified", children:.}
+  ' "$TMP/local-resolved.json"
 }
 
 LOCAL=$(local_inventory) || exit $?
@@ -418,7 +433,7 @@ fi
 jq -e '
   .schema == "fm-herdr-linear-inventory.v1"
   and ((.home | type) == "string" and (.home | length) > 0)
-  and (.ownership_status == "verified" or .ownership_status == "needs-deep-check")
+  and .ownership_status == "verified"
   and (.children | type) == "array"
   and all(.children[]?;
     ((.task_id | type) == "string" and (.task_id | length) > 0)
@@ -590,18 +605,13 @@ REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.j
          detail:("Herdr cannot establish liveness for an unbound worker record (endpoint status "
            + $worker.endpoint_status + ")")}
     ] as $unresolved_findings
-  | [ $local[0], $zeus[0]
-      | select(.ownership_status == "needs-deep-check")
-      | {kind:"needs-deep-check", home:.home,
-         detail:"worker ownership completeness is unproven"}
-    ] as $inventory_findings
   | {schema:"fm-herdr-linear-reconcile.v1", local_inventory:$local[0], zeus_inventory:$zeus[0],
      cards:$cards,
-     findings:(($card_findings + $worker_findings + $unresolved_findings + $inventory_findings)
+     findings:(($card_findings + $worker_findings + $unresolved_findings)
        | sort_by(.kind, (.home // ""), (.card_id // ""), (.task_id // ""))),
      summary:{cards:($cards | length), workers:($workers | length),
               matched:([$card_findings[] | select(.kind == "matched-live-endpoint")] | length),
-              needs_deep_check:([($card_findings + $worker_findings + $unresolved_findings + $inventory_findings)[]
+              needs_deep_check:([($card_findings + $worker_findings + $unresolved_findings)[]
                 | select(.kind != "matched-live-endpoint")] | length)}}
 ')
 

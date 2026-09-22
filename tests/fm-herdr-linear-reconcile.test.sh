@@ -49,6 +49,7 @@ case "${1:-} ${2:-}" in
     ;;
   'tab list')
     case "$mode:$workspace" in
+      race-start:w-owned|race-stop:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"fm-buildboard"},{"tab_id":"t-race","label":"fm-race"}]}}' ;;
       inherited:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"fm-buildboard"},{"tab_id":"t-unrecorded","label":"fm-unrecorded"}]}}' ;;
       inherited:w-foreign) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-foreign","label":"fm-foreign"}]}}' ;;
       moved:w-moved|ambiguous-owner:w-moved) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-moved","label":"fm-renamed-owner"}]}}' ;;
@@ -65,6 +66,10 @@ case "${1:-} ${2:-}" in
     ;;
   'pane list')
     case "$mode:$workspace" in
+      race-start:w-owned|race-stop:w-owned)
+        : > "$FM_TEST_LIVENESS_READY"
+        printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-launch"},{"pane_id":"p-race","tab_id":"t-race"}]}}'
+        ;;
       inherited:w-owned) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-launch"},{"pane_id":"p-unrecorded","tab_id":"t-unrecorded"}]}}' ;;
       inherited:w-foreign) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-foreign","tab_id":"t-foreign"}]}}' ;;
       moved:w-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-moved"}]}}' ;;
@@ -110,6 +115,16 @@ case "${1:-} ${2:-}" in
     ;;
   'agent get')
     case "${3:-}" in
+      p-race)
+        count=$(cat "$FM_TEST_LIVENESS_COUNT" 2>/dev/null || echo 0)
+        printf '%s\n' "$((count + 1))" > "$FM_TEST_LIVENESS_COUNT"
+        if { [ "$mode" = race-start ] && [ -e "$FM_TEST_LIVENESS_READY" ]; } \
+          || { [ "$mode" = race-stop ] && [ ! -e "$FM_TEST_LIVENESS_READY" ]; }; then
+          printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}'
+        else
+          printf '%s\n' '{"error":{"code":"agent_not_found"}}'
+        fi
+        ;;
       p-launch|p-zeus|p-zeus-worker|p-working|p-review|p-shared|p-stale|p-unrecorded|p-foreign|p-projected|p-moved-worker|p-parent-flat) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
       p-idle) printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}' ;;
       *) printf '%s\n' '{"error":{"code":"agent_not_found"}}' ;;
@@ -496,6 +511,37 @@ test_process_liveness_outranks_recorded_agent_status() {
   pass "process-backed liveness accepts live idle agents and rejects stale working registrations"
 }
 
+test_inventory_uses_one_post_discovery_liveness_sample() {
+  local dir cards out ready count mode
+  for mode in race-start race-stop; do
+    dir=$(make_case "$mode")
+    cards="$dir/cards.json"
+    ready="$dir/liveness-ready"
+    count="$dir/liveness-count"
+    write_meta "$dir/home" race p-race ''
+    printf '%s\n' '{"cards":[]}' > "$cards"
+    out=$(FM_TEST_HERDR_DISCOVERY="$mode" FM_TEST_LIVENESS_READY="$ready" \
+      FM_TEST_LIVENESS_COUNT="$count" run_reconcile "$dir" "$cards") \
+      || fail "$mode reconciliation failed"
+    [ "$(cat "$count")" = 1 ] || fail "$mode sampled one endpoint more than once"
+    if [ "$mode" = race-start ]; then
+      printf '%s' "$out" | jq -e '
+        .summary.workers == 1
+        and .local_inventory.children == [{task_id:"race", linear_card_id:"",
+          backend:"herdr", endpoint:"jarvis:p-race", herdr_session:"jarvis",
+          herdr_pane_id:"p-race", endpoint_status:"alive"}]
+      ' >/dev/null || fail "post-discovery worker start used stale liveness: $out"
+    else
+      printf '%s' "$out" | jq -e '
+        .summary == {cards:0, workers:0, matched:0, needs_deep_check:0}
+        and .local_inventory.children[0].task_id == "race"
+        and .local_inventory.children[0].endpoint_status == "dead"
+      ' >/dev/null || fail "post-discovery worker stop used stale liveness: $out"
+    fi
+  done
+  pass "inventory samples each Herdr endpoint once after discovery"
+}
+
 test_empty_card_identities_are_rejected() {
   local dir cards out rc
   dir=$(make_case empty-card-identity)
@@ -551,13 +597,6 @@ test_live_remote_inventory_requires_complete_schema() {
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "another home was accepted as Zeus inventory"
   case "$out" in *'live Zeus inventory returned home'*) ;; *) fail "wrong Zeus owner diagnostic drifted: $out" ;; esac
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"needs-deep-check","children":[]}' > "$zeus"
-  out=$(run_reconcile "$dir" "$cards") || fail "unproven Zeus ownership inventory was rejected"
-  printf '%s' "$out" | jq -e '
-    .summary.needs_deep_check == 1
-    and .findings == [{kind:"needs-deep-check", home:"/remote/zeus-home",
-      detail:"worker ownership completeness is unproven"}]
-  ' >/dev/null || fail "unproven Zeus ownership did not trigger one deep check: $out"
   pass "live Zeus inventory requires its registered route and complete child schema"
 }
 
@@ -751,6 +790,7 @@ test_unrelated_worker_and_missing_endpoint
 test_unbound_unresolved_worker_requires_deep_check
 test_non_applicable_columns_do_not_cover_workers
 test_process_liveness_outranks_recorded_agent_status
+test_inventory_uses_one_post_discovery_liveness_sample
 test_empty_card_identities_are_rejected
 test_live_remote_inventory_requires_complete_schema
 test_linear_api_requires_project_and_reads_all_pages
