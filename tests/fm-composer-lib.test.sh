@@ -849,13 +849,9 @@ test_incomplete_lower_box_invalidates_stale_candidate() {
 }
 
 test_stale_incomplete_box_above_live_pi_pair() {
-  # task fm-pi-composer-stale-box-exit (COD-5145): a stale, never-closed
-  # transcript table box ABOVE the live pi composer must not shadow it. The
-  # bottom-most candidate wins, and the pi pair is a COMPLETE live shape, so
-  # it advances the selection boundary exactly as a proven box does. The Zues
-  # screen had an incomplete table box from row 10 and a valid pair at rows
-  # 15..17 under a native pi/done identity; the stale box made the cursorless
-  # selection refuse before the newer pair was ever considered.
+  # A stale, never-closed transcript table above the live pi composer must not
+  # shadow it. The complete pi pair advances the selection boundary exactly as
+  # a proven box does before the incomplete-box check runs.
   local box pair_blank pair_typed pair_below pi_idle
   pi_idle=$(printf 'pi\tidle')
   box=$'transcript one\ntranscript two\n╭───────────────────────╮\n│ table header  │ value  │\n│ row           │ 1      │\n'
