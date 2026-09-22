@@ -900,27 +900,27 @@ test_ship_and_scout_teach_validation_round_pause() {
   pass "fm-brief.sh: ship and scout scaffolds teach validation-round pauses"
 }
 
-# The generated brief's own top-level headings are the structure fm-brief.sh
-# owns, so they are the anchor for asking which block an instruction landed in.
-# Prints the named section's body, stopping at the next top-level heading.
-brief_section() {  # <heading> <brief>
-  awk -v h="$1" '$0 == h { inside = 1; next } /^# / { inside = 0 } inside' "$2"
+# fm-brief.sh emits the brief as blank-line-delimited paragraphs under its own
+# `# ` headings - structure the generator owns, not prose. Prints the paragraph
+# containing <anchor>.
+brief_paragraph() {  # <anchor> <brief>
+  awk -v a="$1" 'BEGIN { RS = "" } index($0, a)' "$2"
 }
 
-# The wait declaration must sit at each point of use, not merely somewhere in
-# the brief: inside the no-mistakes Definition of done right after the
-# background-and-poll paragraph the worker rereads when it starts polling, and
-# inside the scout rules block where a scout settles into a long run. Asserting
-# the owning section is what catches a relocation back into a shared rule 4,
-# which a whole-file count cannot see.
+# A worker that settles into a long poll must be told to declare the wait, and
+# the instruction must sit in the block that describes that wait - the
+# no-mistakes polling paragraph, the scout rules block - not in a distant
+# section a worker reads once at launch. Shapes whose worker never drives a
+# long-running run must not carry it at all. Only the status-line template is
+# asserted, so rewording the prose around it breaks nothing.
 test_wait_declaration_instruction_placement() {
-  local home kind id brief verb rc declarations tpl dod poll_at decl_at
+  local home kind id brief verb rc tpl anchor
   local -a args
   home="$TMP_ROOT/wait-declaration-home"
   mkdir -p "$home/data"
 
   for verb in "" awaiting; do
-    for kind in ship:no-mistakes scout secondmate; do
+    for kind in ship:no-mistakes ship:direct-PR ship:local-only scout secondmate; do
       id="wait-declaration-${kind//:/-}${verb:+-$verb}"
       case "$kind" in
         ship:*) args=("$id" firstmate --mode "${kind#ship:}") ;;
@@ -930,40 +930,26 @@ test_wait_declaration_instruction_placement() {
       FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
         "$ROOT/bin/fm-brief.sh" "${args[@]}" >/dev/null 2>&1
       rc=$?
-      expect_code 0 "$rc" "$kind scaffold (pause verb ${verb:-default}) must scaffold a brief"
+      expect_code 0 "$rc" "$kind (pause verb ${verb:-default}) must scaffold a brief"
       brief="$home/data/$id/brief.md"
       assert_present "$brief" \
-        "$kind scaffold (pause verb ${verb:-default}) wrote no brief to $brief"
+        "$kind (pause verb ${verb:-default}) wrote no brief to $brief"
 
       tpl="\`${verb:-paused} [at=<epoch>]: {what you are waiting for}\`"
-      declarations=$(grep -c -F -- "$tpl" "$brief")
-      if [ "$kind" = secondmate ]; then
-        [ "$declarations" = 0 ] || fail \
-          "secondmate charter renders $declarations wait declarations; it must render none"
-        continue
-      fi
-      [ "$declarations" = 1 ] || fail \
-        "$kind brief renders $declarations wait declarations in the configured verb; expected exactly one"
-
       case "$kind" in
-        ship:no-mistakes)
-          dod=$(brief_section '# Definition of done' "$brief")
-          printf '%s\n' "$dod" | grep -qF -- "$tpl" || fail \
-            "$kind brief does not declare the wait in its Definition of done, where the worker polls"
-          poll_at=$(printf '%s\n' "$dod" | grep -n -F -- 'background the drive call and poll' | cut -d: -f1 | head -1)
-          decl_at=$(printf '%s\n' "$dod" | grep -n -F -- "$tpl" | cut -d: -f1 | head -1)
-          [ -n "$poll_at" ] || fail "$kind Definition of done no longer tells the worker to background and poll"
-          [ "$decl_at" -gt "$poll_at" ] && [ $((decl_at - poll_at)) -le 3 ] || fail \
-            "$kind brief declares the wait $((decl_at - poll_at)) lines from the background-and-poll paragraph, not at it"
-          ;;
-        scout)
-          printf '%s\n' "$(brief_section '# Rules' "$brief")" | grep -qF -- "$tpl" || fail \
-            "$kind brief does not declare the wait in its rules block, where a scout settles into a long run"
+        ship:no-mistakes) anchor='background the drive call and poll' ;;
+        scout) anchor='# Rules' ;;
+        *)
+          assert_no_grep "$tpl" "$brief" \
+            "$kind brief declares a polling wait its worker never performs"
+          continue
           ;;
       esac
+      brief_paragraph "$anchor" "$brief" | grep -qF -- "$tpl" || fail \
+        "$kind brief does not declare the wait inside the block anchored at \"$anchor\""
     done
   done
-  pass "fm-brief.sh: the wait declaration sits in the block that is its point of use"
+  pass "fm-brief.sh: a polling worker is told to declare its wait, in the block that waits"
 }
 
 test_scout_and_secondmate_load_decision_hold_policy() {
