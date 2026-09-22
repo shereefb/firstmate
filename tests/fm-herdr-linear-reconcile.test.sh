@@ -12,7 +12,7 @@ SCRIPT="$ROOT/bin/fm-herdr-linear-reconcile.sh"
 make_case() { # <name>
   local name=$1 dir
   dir="$TMP_ROOT/$name"
-  mkdir -p "$dir/home/state" "$dir/home/data" "$dir/bin"
+  mkdir -p "$dir/home/state" "$dir/home/data" "$dir/parent/state" "$dir/bin"
   cat > "$dir/bin/herdr" <<'SH'
 #!/usr/bin/env bash
 mode=${FM_TEST_HERDR_DISCOVERY:-empty}
@@ -44,9 +44,12 @@ case "${1:-} ${2:-}" in
     ;;
   'tab list')
     case "$mode:$workspace" in
-      inherited:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"buildboard"},{"tab_id":"t-unrecorded","label":"fm-unrecorded"}]}}' ;;
+      inherited:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"fm-buildboard"},{"tab_id":"t-unrecorded","label":"fm-unrecorded"}]}}' ;;
       inherited:w-foreign) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-foreign","label":"fm-foreign"}]}}' ;;
+      zeus:w-zeus) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus","label":"fm-zeus"},{"tab_id":"t-zeus-worker","label":"fm-zeus-worker"}]}}' ;;
       projection:w-projected) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-projected","label":"fm-projected"}]}}' ;;
+      *:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"fm-buildboard"}]}}' ;;
+      *:w-zeus) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus","label":"fm-zeus"}]}}' ;;
       *) printf '%s\n' '{"result":{"tabs":[]}}' ;;
     esac
     ;;
@@ -54,26 +57,32 @@ case "${1:-} ${2:-}" in
     case "$mode:$workspace" in
       inherited:w-owned) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-launch"},{"pane_id":"p-unrecorded","tab_id":"t-unrecorded"}]}}' ;;
       inherited:w-foreign) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-foreign","tab_id":"t-foreign"}]}}' ;;
+      zeus:w-zeus) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus","tab_id":"t-zeus"},{"pane_id":"p-zeus-worker","tab_id":"t-zeus-worker"}]}}' ;;
       projection:w-projected) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-projected","tab_id":"t-projected"}]}}' ;;
+      *:w-owned) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-launch"}]}}' ;;
+      *:w-zeus) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus","tab_id":"t-zeus"}]}}' ;;
       *) printf '%s\n' '{"result":{"panes":[]}}' ;;
     esac
     ;;
   'pane get')
+    [ "$mode" != fail ] || exit 1
     case "${3:-}" in
       p-missing) printf '%s\n' '{"error":{"code":"pane_not_found"}}' ;;
       p-launch) printf '%s\n' '{"result":{"pane":{"pane_id":"p-launch","tab_id":"t-launch","workspace_id":"w-owned"}}}' ;;
+      p-zeus) printf '%s\n' '{"result":{"pane":{"pane_id":"p-zeus","tab_id":"t-zeus","workspace_id":"w-zeus"}}}' ;;
       *) printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "${3:-}" ;;
     esac
     ;;
   'tab get')
     case "${3:-}" in
       t-launch) printf '%s\n' '{"result":{"tab":{"tab_id":"t-launch","workspace_id":"w-owned"}}}' ;;
+      t-zeus) printf '%s\n' '{"result":{"tab":{"tab_id":"t-zeus","workspace_id":"w-zeus"}}}' ;;
       *) printf '%s\n' '{"error":{"code":"tab_not_found"}}' ;;
     esac
     ;;
   'agent get')
     case "${3:-}" in
-      p-working|p-review|p-shared|p-stale|p-unrecorded|p-foreign|p-projected) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
+      p-launch|p-zeus|p-zeus-worker|p-working|p-review|p-shared|p-stale|p-unrecorded|p-foreign|p-projected) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
       p-idle) printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}' ;;
       *) printf '%s\n' '{"error":{"code":"agent_not_found"}}' ;;
     esac
@@ -113,6 +122,13 @@ done
 cat "$FM_TEST_ZEUS_LIVE_INVENTORY"
 SH
   chmod +x "$dir/bin/herdr" "$dir/bin/fake-ps" "$dir/bin/fake-ssh"
+  printf '%s\n' buildboard > "$dir/home/.fm-secondmate-home"
+  cat > "$dir/home/.fm-secondmate-parent" <<EOF
+schema=fm-secondmate-parent.v1
+route=local
+parent_home=$dir/parent
+EOF
+  write_owner_meta "$dir/parent/state/buildboard.meta" buildboard "$dir/home" jarvis w-owned t-launch p-launch
   printf '%s\n' \
     '- zeus - Operating Studio delivery (host: zeus-host; root: /remote/firstmate; home: /remote/zeus-home; scope: Operating Studio delivery; projects: operating-studio; added 2026-09-22)' \
     '- other - Other delivery (host: zeus-host; root: /remote/firstmate; home: /remote/other-home; scope: Other delivery; projects: other; added 2026-09-22)' \
@@ -120,6 +136,24 @@ SH
   printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[]}' > "$dir/zeus-live.json"
   write_linear_curl "$dir"
   printf '%s\n' "$dir"
+}
+
+write_owner_meta() { # <meta> <id> <home> <session> <workspace> <tab> <pane>
+  local meta=$1 id=$2 home=$3 session=$4 workspace=$5 tab=$6 pane=$7
+  {
+    printf 'window=%s:%s\n' "$session" "$pane"
+    printf 'endpoint_task_id=%s\n' "$id"
+    printf 'worktree=%s\n' "$home"
+    printf 'project=%s\n' "$home"
+    printf 'harness=codex\n'
+    printf 'kind=secondmate\n'
+    printf 'home=%s\n' "$home"
+    printf 'backend=herdr\n'
+    printf 'herdr_session=%s\n' "$session"
+    printf 'herdr_workspace_id=%s\n' "$workspace"
+    printf 'herdr_tab_id=%s\n' "$tab"
+    printf 'herdr_pane_id=%s\n' "$pane"
+  } > "$meta"
 }
 
 write_linear_curl() { # <case-dir>
@@ -211,6 +245,15 @@ run_reconcile() { # <case-dir> <cards>
     "$SCRIPT" --linear-api
 }
 
+run_inventory() { # <case-dir> <home>
+  local dir=$1 home=$2
+  PATH="$dir/bin:$PATH" FM_HERDR_PS_BIN="$dir/bin/fake-ps" FM_HOME="$home" \
+    HERDR_PANE_ID="${FM_TEST_AMBIENT_PANE:-}" \
+    HERDR_SESSION="${FM_TEST_AMBIENT_SESSION:-}" \
+    HERDR_SOCKET_PATH="${FM_TEST_AMBIENT_SOCKET:-}" \
+    "$SCRIPT" --inventory
+}
+
 test_equal_count_wrong_identity() {
   local dir cards out
   dir=$(make_case equal-count)
@@ -251,9 +294,7 @@ test_exact_live_worker_ownership_is_discovered() {
   dir=$(make_case inherited-worker)
   cards="$dir/cards.json"
   printf '%s\n' '{"cards":[]}' > "$cards"
-  out=$(FM_TEST_HERDR_DISCOVERY=inherited FM_TEST_LAUNCHER_PANE_ID=p-launch \
-    FM_TEST_LAUNCHER_SESSION=jarvis FM_TEST_LAUNCHER_SOCKET=/tmp/herdr-jarvis.sock \
-    run_reconcile "$dir" "$cards") \
+  out=$(FM_TEST_HERDR_DISCOVERY=inherited run_reconcile "$dir" "$cards") \
     || fail "inherited live worker discovery failed"
   printf '%s' "$out" | jq -e '
     .summary.workers == 1
@@ -292,15 +333,49 @@ test_exact_live_worker_ownership_is_discovered() {
   dir=$(make_case unavailable-worker-ownership)
   cards="$dir/cards.json"
   printf '%s\n' '{"cards":[]}' > "$cards"
-  out=$(FM_TEST_HERDR_DISCOVERY=fail FM_TEST_LAUNCHER_PANE_ID=p-launch \
-    FM_TEST_LAUNCHER_SESSION=jarvis FM_TEST_LAUNCHER_SOCKET=/tmp/herdr-jarvis.sock \
-    run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
+  out=$(FM_TEST_HERDR_DISCOVERY=fail run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "unavailable Herdr population was treated as empty"
   case "$out" in
-    *'could not verify the inherited Herdr workspace'*) ;;
+    *'could not verify the inventory home Herdr owner'*) ;;
     *) fail "unavailable Herdr population diagnostic drifted: $out" ;;
   esac
+
+  dir=$(make_case missing-owner-record)
+  cards="$dir/cards.json"
+  printf '%s\n' '{"cards":[]}' > "$cards"
+  rm -f "$dir/parent/state/buildboard.meta"
+  out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "missing owner record was treated as an empty inventory"
+  case "$out" in
+    *'could not verify the inventory home Herdr owner'*) ;;
+    *) fail "missing owner record diagnostic drifted: $out" ;;
+  esac
   pass "inventory uses exact inherited and projected ownership bindings"
+}
+
+test_remote_home_inventory_uses_host_local_owner_record() {
+  local dir remote out
+  dir=$(make_case remote-owner)
+  remote="$dir/remote-home"
+  mkdir -p "$remote/state/parent-route"
+  printf '%s\n' zeus > "$remote/.fm-secondmate-home"
+  cat > "$remote/.fm-secondmate-parent" <<'EOF'
+schema=fm-secondmate-parent.v1
+route=remote
+parent_host=jarvis-host
+EOF
+  write_owner_meta "$remote/state/parent-route/zeus.meta" zeus "$remote" jarvis w-zeus t-zeus p-zeus
+  out=$(FM_TEST_HERDR_DISCOVERY=zeus \
+    FM_TEST_AMBIENT_PANE=p-launch FM_TEST_AMBIENT_SESSION=jarvis \
+    FM_TEST_AMBIENT_SOCKET=/tmp/herdr-jarvis.sock \
+    run_inventory "$dir" "$remote") \
+    || fail "remote home inventory could not resolve its host-local owner record"
+  printf '%s' "$out" | jq -e '
+    .children == [{task_id:"zeus-worker", linear_card_id:"", backend:"herdr",
+      endpoint:"jarvis:p-zeus-worker", herdr_session:"jarvis",
+      herdr_pane_id:"p-zeus-worker", endpoint_status:"alive"}]
+  ' >/dev/null || fail "remote home inventory used ambient or label ownership: $out"
+  pass "remote inventory binds flat workers to its host-local owner record"
 }
 
 test_local_registered_inventory_route_is_accepted() {
@@ -308,12 +383,22 @@ test_local_registered_inventory_route_is_accepted() {
   dir=$(make_case local-inventory-route)
   cards="$dir/cards.json"
   zeus_home="$dir/zeus-home"
-  mkdir -p "$zeus_home"
+  mkdir -p "$zeus_home/state"
+  printf '%s\n' zeus > "$zeus_home/.fm-secondmate-home"
+  cat > "$zeus_home/.fm-secondmate-parent" <<EOF
+schema=fm-secondmate-parent.v1
+route=local
+parent_home=$dir/home
+EOF
+  write_owner_meta "$dir/home/state/zeus.meta" zeus "$zeus_home" jarvis w-zeus t-zeus p-zeus
   printf '%s\n' "- zeus - Operating Studio delivery (home: $zeus_home; scope: Operating Studio delivery; projects: operating-studio; added 2026-09-22)" > "$dir/home/data/secondmates.md"
   printf '%s\n' '{"cards":[]}' > "$cards"
-  out=$(run_reconcile "$dir" "$cards") || fail "local registered Zeus inventory failed"
+  out=$(FM_TEST_HERDR_DISCOVERY=zeus run_reconcile "$dir" "$cards") \
+    || fail "local registered Zeus inventory failed"
   printf '%s' "$out" | jq -e --arg home "$zeus_home" '
-    .summary.workers == 0 and .zeus_inventory.home == $home
+    .summary.workers == 1
+    and .zeus_inventory.home == $home
+    and .zeus_inventory.children[0].task_id == "zeus-worker"
   ' >/dev/null || fail "local Zeus route was not preserved: $out"
   pass "local registered Zeus inventory route is accepted"
 }
@@ -521,6 +606,7 @@ test_required_inputs_fail_clearly() {
 test_equal_count_wrong_identity
 test_remote_inventory_is_fetched_live
 test_exact_live_worker_ownership_is_discovered
+test_remote_home_inventory_uses_host_local_owner_record
 test_local_registered_inventory_route_is_accepted
 test_duplicate_ownership_and_endpoint_identity
 test_unrelated_worker_and_missing_endpoint

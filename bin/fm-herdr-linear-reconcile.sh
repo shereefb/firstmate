@@ -6,7 +6,7 @@
 #   fm-herdr-linear-reconcile.sh --linear-api
 #
 # `--inventory` is run by each owning home. It joins direct child metadata with
-# the caller's exact inherited workspace and exact home-bound projections.
+# its exact registered launcher workspace and exact home-bound projections.
 # A parent receives a fresh secondmate inventory through its registered route;
 # it never enumerates the secondmate's panes itself.
 # The comparison joins a Linear issue's immutable `id` to `linear_card_id=` in
@@ -33,6 +33,8 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-backend.sh"
 # shellcheck source=bin/fm-secondmate-registry-lib.sh
 . "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
+# shellcheck source=bin/fm-secondmate-parent-lib.sh
+. "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
 
 MODE=compare
 LINEAR_API=0
@@ -126,36 +128,94 @@ append_live_worker() { # <rows> <task-id> <session> <pane>
   esac
 }
 
-discover_inherited_workers() { # <rows>
-  local rows=$1 session status tabs panes pane task_id
-  [ -n "${HERDR_PANE_ID:-}" ] || return 0
-  session=$(fm_backend_herdr_session)
-  fm_backend_herdr_launcher_identity "$session" && status=0 || status=$?
-  [ "$status" -eq 0 ] || {
-    echo 'fm-herdr-linear-reconcile: could not verify the inherited Herdr workspace' >&2
+resolve_inventory_owner() {
+  local marker="$FM_HOME/.fm-secondmate-home" parent="$FM_HOME/.fm-secondmate-parent"
+  local owner meta recorded_home canonical_home canonical_recorded status pane_out tab_out
+  INVENTORY_OWNER_ID=
+  INVENTORY_OWNER_SESSION=
+  INVENTORY_OWNER_WORKSPACE=
+  INVENTORY_OWNER_TAB=
+  INVENTORY_OWNER_PANE=
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+    owner=$(cat "$marker" 2>/dev/null) || return 1
+    task_id_valid "$owner" || return 1
+    fm_secondmate_parent_record_parse "$parent" || return 1
+    case "$FM_SECONDMATE_PARENT_ROUTE" in
+      local) meta="$FM_SECONDMATE_PARENT_HOME/state/$owner.meta" ;;
+      remote) meta="$STATE/parent-route/$owner.meta" ;;
+      *) return 1 ;;
+    esac
+    [ -f "$meta" ] && [ ! -L "$meta" ] || return 1
+    [ "$(meta_value "$meta" kind)" = secondmate ] || return 1
+    recorded_home=$(meta_value "$meta" home)
+    canonical_home=$(CDPATH='' cd -- "$FM_HOME" 2>/dev/null && pwd -P) || return 1
+    canonical_recorded=$(CDPATH='' cd -- "$recorded_home" 2>/dev/null && pwd -P) || return 1
+    [ "$canonical_recorded" = "$canonical_home" ] || return 1
+    fm_backend_validate_task_endpoint "$meta" "$owner" 2>/dev/null || return 1
+    [ "$FM_BACKEND_VALIDATED_BACKEND" = herdr ] || return 1
+    INVENTORY_OWNER_ID=$owner
+    INVENTORY_OWNER_SESSION=$(meta_value "$meta" herdr_session)
+    INVENTORY_OWNER_WORKSPACE=$(meta_value "$meta" herdr_workspace_id)
+    INVENTORY_OWNER_TAB=$(meta_value "$meta" herdr_tab_id)
+    INVENTORY_OWNER_PANE=$(meta_value "$meta" herdr_pane_id)
+    [ "$FM_BACKEND_VALIDATED_TARGET" = "$INVENTORY_OWNER_SESSION:$INVENTORY_OWNER_PANE" ] \
+      && [ -n "$INVENTORY_OWNER_WORKSPACE" ] && [ -n "$INVENTORY_OWNER_TAB" ] || return 1
+  else
+    INVENTORY_OWNER_SESSION=$(fm_backend_herdr_session)
+    fm_backend_herdr_launcher_identity "$INVENTORY_OWNER_SESSION" && status=0 || status=$?
+    [ "$status" -eq 0 ] || return 1
+    INVENTORY_OWNER_WORKSPACE=$FM_BACKEND_HERDR_LAUNCHER_WORKSPACE_ID
+    INVENTORY_OWNER_TAB=$FM_BACKEND_HERDR_LAUNCHER_TAB_ID
+    INVENTORY_OWNER_PANE=$FM_BACKEND_HERDR_LAUNCHER_PANE_ID
+  fi
+  [ "$(fm_backend_agent_state herdr "$INVENTORY_OWNER_SESSION:$INVENTORY_OWNER_PANE")" = alive ] \
+    || return 1
+  pane_out=$(fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" pane get "$INVENTORY_OWNER_PANE" 2>/dev/null) \
+    || return 1
+  printf '%s' "$pane_out" | jq -e \
+    --arg pane "$INVENTORY_OWNER_PANE" --arg tab "$INVENTORY_OWNER_TAB" \
+    --arg workspace "$INVENTORY_OWNER_WORKSPACE" '
+      .result.pane.pane_id == $pane
+      and .result.pane.tab_id == $tab
+      and .result.pane.workspace_id == $workspace
+    ' >/dev/null 2>&1 || return 1
+  tab_out=$(fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" tab get "$INVENTORY_OWNER_TAB" 2>/dev/null) \
+    || return 1
+  printf '%s' "$tab_out" | jq -e \
+    --arg tab "$INVENTORY_OWNER_TAB" --arg workspace "$INVENTORY_OWNER_WORKSPACE" '
+      .result.tab.tab_id == $tab and .result.tab.workspace_id == $workspace
+    ' >/dev/null 2>&1
+}
+
+discover_owned_flat_workers() { # <rows>
+  local rows=$1 tabs panes pane task_id
+  resolve_inventory_owner || {
+    echo 'fm-herdr-linear-reconcile: could not verify the inventory home Herdr owner' >&2
     return 1
   }
   tabs="$TMP/herdr-inherited-tabs.json"
   panes="$TMP/herdr-inherited-panes.json"
-  if ! fm_backend_herdr_cli "$session" tab list \
-      --workspace "$FM_BACKEND_HERDR_LAUNCHER_WORKSPACE_ID" > "$tabs" 2>/dev/null \
+  if ! fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" tab list \
+      --workspace "$INVENTORY_OWNER_WORKSPACE" > "$tabs" 2>/dev/null \
     || ! jq -e '(.result.tabs | type) == "array" and all(.result.tabs[]?;
       (.tab_id | type) == "string" and (.tab_id | length) > 0
       and (.label | type) == "string")' "$tabs" >/dev/null 2>&1 \
-    || ! fm_backend_herdr_cli "$session" pane list \
-      --workspace "$FM_BACKEND_HERDR_LAUNCHER_WORKSPACE_ID" > "$panes" 2>/dev/null \
+    || ! fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" pane list \
+      --workspace "$INVENTORY_OWNER_WORKSPACE" > "$panes" 2>/dev/null \
     || ! jq -e '(.result.panes | type) == "array" and all(.result.panes[]?;
       (.pane_id | type) == "string" and (.pane_id | length) > 0
       and (.tab_id | type) == "string" and (.tab_id | length) > 0)' "$panes" >/dev/null 2>&1; then
-    echo "fm-herdr-linear-reconcile: could not enumerate inherited Herdr workspace $FM_BACKEND_HERDR_LAUNCHER_WORKSPACE_ID" >&2
+    echo "fm-herdr-linear-reconcile: could not enumerate inventory Herdr workspace $INVENTORY_OWNER_WORKSPACE" >&2
     return 1
   fi
   while IFS=$'\t' read -r pane task_id; do
     [ -n "$pane" ] || continue
-    append_live_worker "$rows" "$task_id" "$session" "$pane" || return 1
-  done < <(jq -r --slurpfile panes "$panes" '
+    append_live_worker "$rows" "$task_id" "$INVENTORY_OWNER_SESSION" "$pane" || return 1
+  done < <(jq -r --slurpfile panes "$panes" --arg owner "$INVENTORY_OWNER_ID" '
     .result.tabs[]
-    | select(.label | startswith("fm-") and length > 3) as $tab
+    | select(.label | startswith("fm-") and length > 3)
+    | select($owner == "" or .label != ("fm-" + $owner)) as $tab
     | $panes[0].result.panes[]
     | select(.tab_id == $tab.tab_id)
     | [.pane_id, $tab.label[3:]]
@@ -198,7 +258,7 @@ discover_projected_workers() { # <rows>
 
 discover_live_workers() { # <rows>
   : > "$1"
-  discover_inherited_workers "$1" || return 1
+  discover_owned_flat_workers "$1" || return 1
   discover_projected_workers "$1"
 }
 
