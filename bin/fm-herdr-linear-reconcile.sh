@@ -27,14 +27,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
+# shellcheck source=bin/fm-secondmate-registry-lib.sh
+. "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
 
 MODE=compare
 ZEUS_INVENTORY=
 JSON_ONLY=0
 LINEAR_API=0
+ZEUS_ID=zeus
 
 usage() {
   cat <<'EOF'
@@ -183,6 +187,12 @@ jq -e '
   echo 'fm-herdr-linear-reconcile: Zeus inventory is invalid' >&2
   exit 1
 }
+zeus_home=$(jq -r '.home' "$ZEUS_INVENTORY")
+if ! secondmate_registry_validate_bindings \
+  "$DATA/secondmates.md" secondmate_registry_path_key "$ZEUS_ID" "$zeus_home"; then
+  echo "fm-herdr-linear-reconcile: Zeus inventory does not match its registered route: $SECONDMATE_REGISTRY_ERROR" >&2
+  exit 1
+fi
 cp "$ZEUS_INVENTORY" "$TMP/zeus.json"
 
 command -v curl >/dev/null 2>&1 || {

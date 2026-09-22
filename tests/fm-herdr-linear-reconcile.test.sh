@@ -12,7 +12,7 @@ SCRIPT="$ROOT/bin/fm-herdr-linear-reconcile.sh"
 make_case() { # <name>
   local name=$1 dir
   dir="$TMP_ROOT/$name"
-  mkdir -p "$dir/home/state" "$dir/bin"
+  mkdir -p "$dir/home/state" "$dir/home/data" "$dir/bin"
   cat > "$dir/bin/herdr" <<'SH'
 #!/usr/bin/env bash
 case "${1:-} ${2:-}" in
@@ -50,7 +50,11 @@ case "$*" in
 esac
 SH
   chmod +x "$dir/bin/herdr" "$dir/bin/fake-ps"
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"zeus-home","children":[]}' > "$dir/zeus.json"
+  printf '%s\n' \
+    '- zeus - Operating Studio delivery (host: zeus-host; root: /remote/firstmate; home: /remote/zeus-home; scope: Operating Studio delivery; projects: operating-studio; added 2026-09-22)' \
+    '- other - Other delivery (host: zeus-host; root: /remote/firstmate; home: /remote/other-home; scope: Other delivery; projects: other; added 2026-09-22)' \
+    > "$dir/home/data/secondmates.md"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[]}' > "$dir/zeus.json"
   write_linear_curl "$dir"
   printf '%s\n' "$dir"
 }
@@ -129,13 +133,29 @@ test_remote_inventory_is_joined_without_remote_probe() {
   zeus="$dir/zeus.json"
   printf '%s\n' '{"cards":[{"id":"card-zeus","identifier":"OS-9","state":"In Progress"}]}' > "$cards"
   cat > "$zeus" <<'JSON'
-{"schema":"fm-herdr-linear-inventory.v1","home":"zeus-home","children":[{"task_id":"zeus-worker","linear_card_id":"card-zeus","backend":"herdr","endpoint":"zeus:p9","herdr_session":"zeus","herdr_pane_id":"p9","pr":"","endpoint_status":"alive"}]}
+{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"zeus-worker","linear_card_id":"card-zeus","backend":"herdr","endpoint":"zeus:p9","herdr_session":"zeus","herdr_pane_id":"p9","pr":"","endpoint_status":"alive"}]}
 JSON
   out=$(run_reconcile "$dir" "$cards" "$zeus") || fail "remote inventory reconciliation failed"
   printf '%s' "$out" | jq -e '
     .summary.workers == 1 and .findings[0].kind == "matched-live-endpoint"
   ' >/dev/null || fail "returned Zeus inventory was not reconciled: $out"
   pass "parent consumes compact Zeus inventory without probing Zeus lanes"
+}
+
+test_local_registered_inventory_route_is_accepted() {
+  local dir cards zeus_home out
+  dir=$(make_case local-inventory-route)
+  cards="$dir/cards.json"
+  zeus_home="$dir/zeus-home"
+  mkdir -p "$zeus_home"
+  printf '%s\n' "- zeus - Operating Studio delivery (home: $zeus_home; scope: Operating Studio delivery; projects: operating-studio; added 2026-09-22)" > "$dir/home/data/secondmates.md"
+  printf '%s\n' "{\"schema\":\"fm-herdr-linear-inventory.v1\",\"home\":\"$zeus_home\",\"children\":[]}" > "$dir/zeus.json"
+  printf '%s\n' '{"cards":[]}' > "$cards"
+  out=$(run_reconcile "$dir" "$cards") || fail "local registered Zeus inventory failed"
+  printf '%s' "$out" | jq -e --arg home "$zeus_home" '
+    .summary.workers == 0 and .zeus_inventory.home == $home
+  ' >/dev/null || fail "local Zeus route was not preserved: $out"
+  pass "local registered Zeus inventory route is accepted"
 }
 
 test_process_liveness_outranks_recorded_agent_status() {
@@ -177,15 +197,19 @@ test_remote_inventory_requires_complete_schema() {
   cards="$dir/cards.json"
   zeus="$dir/zeus.json"
   printf '%s\n' '{"cards":[]}' > "$cards"
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"zeus-home","children":[{"task_id":"worker","endpoint_status":"alive"}]}' > "$zeus"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","endpoint_status":"alive"}]}' > "$zeus"
   out=$(run_reconcile "$dir" "$cards" "$zeus" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "incomplete Zeus child was accepted"
   case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "incomplete Zeus diagnostic drifted: $out" ;; esac
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p1","herdr_session":"zeus","herdr_pane_id":"p1","pr":"","endpoint_status":"working"}]}' > "$zeus"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p1","herdr_session":"zeus","herdr_pane_id":"p1","pr":"","endpoint_status":"working"}]}' > "$zeus"
   out=$(run_reconcile "$dir" "$cards" "$zeus" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "unknown Zeus endpoint status was accepted"
   case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "unknown Zeus status diagnostic drifted: $out" ;; esac
-  pass "Zeus inventory requires every field and a closed endpoint status"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/other-home","children":[]}' > "$zeus"
+  out=$(run_reconcile "$dir" "$cards" "$zeus" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "another home was accepted as Zeus inventory"
+  case "$out" in *'Zeus inventory does not match its registered route'*) ;; *) fail "wrong Zeus owner diagnostic drifted: $out" ;; esac
+  pass "Zeus inventory requires its registered route and complete child schema"
 }
 
 test_linear_api_requires_project_and_reads_all_pages() {
@@ -290,6 +314,7 @@ test_required_inputs_fail_clearly() {
 
 test_equal_count_wrong_identity
 test_remote_inventory_is_joined_without_remote_probe
+test_local_registered_inventory_route_is_accepted
 test_duplicate_ownership_and_endpoint_are_not_coverage
 test_unrelated_worker_missing_endpoint_and_review_mismatch
 test_non_applicable_columns_do_not_cover_workers
