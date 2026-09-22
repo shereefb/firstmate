@@ -84,6 +84,28 @@ out=$(FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$OTHER_STATE" "$CHECK" inspect) \
   || fail "one-shot inspection bypassed buildboard configuration or the primary route"
 pass "one-shot inspection uses buildboard configuration and primary routing"
 
+EXTERNAL_ENV="$TMP_ROOT/operating-studio-linear.env"
+cat > "$EXTERNAL_ENV" <<'EOF'
+LINEAR_API_KEY=external-read-only-secret
+EOF
+rm -f "$HOME_DIR/.env"
+out=$(FM_HOME="$HOME_DIR" FM_LINEAR_CONFIG_FILE="$EXTERNAL_ENV" \
+  FM_LINEAR_OPERATING_STUDIO_TEAM_ID=external-team \
+  FM_LINEAR_OPERATING_STUDIO_PROJECT_ID=external-project \
+  "$CHECK" inspect) || fail "one-shot inspection could not reference external Linear configuration"
+[ "$out" = '{"schema":"fm-herdr-linear-reconcile.v1","summary":{"needs_deep_check":2}}' ] \
+  || fail "external-config inspection did not print the reconciliation result: $out"
+[ "$(cat "$HOME_DIR/state/fake-env")" = "external-read-only-secret|external-team|external-project|$HOME_DIR/state|$PRIMARY_HOME/data" ] \
+  || fail "inspection did not consume the referenced Linear configuration"
+pass "one-shot inspection can reference read-only Linear configuration"
+
+cat > "$HOME_DIR/.env" <<'EOF'
+FM_LINEAR_READONLY_API_KEY=read-only-secret
+FM_LINEAR_OPERATING_STUDIO_TEAM_ID=team-os
+FM_LINEAR_OPERATING_STUDIO_PROJECT_ID=project-os
+EOF
+chmod 0600 "$HOME_DIR/.env"
+
 printf '%s\n' fail > "$HOME_DIR/state/fake-mode"
 out=$(FM_HOME="$HOME_DIR" FM_HERDR_LINEAR_CHECK_NOW=2800 "$CHECK" check) || fail "failure check did not preserve watcher contract"
 [ "$out" = 'Operating Studio reconciliation check failed: live Zeus inventory unavailable; run bin/fm-herdr-linear-check.sh inspect from buildboard' ] \

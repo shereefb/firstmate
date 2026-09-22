@@ -13,7 +13,7 @@ STATE="$FM_HOME/state"
 CHECK_ID=herdr-linear-reconcile
 CHECK_SHIM="$STATE/$CHECK_ID.check.sh"
 RECORD="$STATE/.herdr-linear-reconcile-check"
-ENV_FILE="$FM_HOME/.env"
+ENV_FILE="${FM_LINEAR_CONFIG_FILE:-$FM_HOME/.env}"
 INTERVAL=900
 OUTPUT_FILE=
 ERROR_FILE=
@@ -115,6 +115,15 @@ load_linear_config() {
   LINEAR_READONLY_API_KEY=$(fmx_env_get FM_LINEAR_READONLY_API_KEY "$ENV_FILE")
   LINEAR_TEAM_ID=$(fmx_env_get FM_LINEAR_OPERATING_STUDIO_TEAM_ID "$ENV_FILE")
   LINEAR_PROJECT_ID=$(fmx_env_get FM_LINEAR_OPERATING_STUDIO_PROJECT_ID "$ENV_FILE")
+  if [ -n "${FM_LINEAR_CONFIG_FILE:-}" ]; then
+    [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] && [ -r "$ENV_FILE" ] || return 1
+    [ -n "$LINEAR_READONLY_API_KEY" ] \
+      || LINEAR_READONLY_API_KEY=$(fmx_env_get LINEAR_API_KEY "$ENV_FILE")
+    [ -n "$LINEAR_TEAM_ID" ] \
+      || LINEAR_TEAM_ID=${FM_LINEAR_OPERATING_STUDIO_TEAM_ID:-}
+    [ -n "$LINEAR_PROJECT_ID" ] \
+      || LINEAR_PROJECT_ID=${FM_LINEAR_OPERATING_STUDIO_PROJECT_ID:-}
+  fi
   [ -n "$LINEAR_READONLY_API_KEY" ] && [ -n "$LINEAR_TEAM_ID" ] && [ -n "$LINEAR_PROJECT_ID" ]
 }
 

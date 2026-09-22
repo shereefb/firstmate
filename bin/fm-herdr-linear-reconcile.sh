@@ -38,7 +38,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 MODE=compare
 LINEAR_API=0
-ZEUS_ID=zeus
+ZEUS_ID=${FM_LINEAR_ZEUS_ROUTE_ID:-zeus}
 
 usage() {
   cat <<'EOF'
@@ -99,6 +99,11 @@ safe_field() { # metadata values become TSV fields
 task_id_valid() {
   case "$1" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac
   [ "${#1}" -le 64 ]
+}
+
+task_id_valid "$ZEUS_ID" || {
+  echo 'fm-herdr-linear-reconcile: FM_LINEAR_ZEUS_ROUTE_ID is invalid' >&2
+  exit 1
 }
 
 append_worker_identity() { # <rows> <task-id> <session> <pane>

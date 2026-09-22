@@ -342,6 +342,22 @@ JSON
   pass "comparison obtains fresh Zeus inventory through its registered route"
 }
 
+test_registered_remote_route_id_is_configurable() {
+  local dir cards out
+  dir=$(make_case configured-remote-route)
+  cards="$dir/cards.json"
+  printf '%s\n' '{"cards":[]}' > "$cards"
+  sed 's/^- zeus /- zues /' "$dir/home/data/secondmates.md" > "$dir/home/data/secondmates.next.md"
+  mv "$dir/home/data/secondmates.next.md" "$dir/home/data/secondmates.md"
+
+  out=$(FM_LINEAR_ZEUS_ROUTE_ID=zues run_reconcile "$dir" "$cards") \
+    || fail "configured Zeus route id was not used"
+  printf '%s' "$out" | jq -e '.summary.cards == 0 and .summary.workers == 0' >/dev/null \
+    || fail "configured Zeus route returned an invalid reconciliation: $out"
+  [ "$(cat "$dir/zeus-ssh.count")" -eq 1 ] || fail "configured Zeus route was not read exactly once"
+  pass "comparison uses the configured registered Zeus route id"
+}
+
 test_exact_live_worker_ownership_is_discovered() {
   local dir cards out rc token
   dir=$(make_case inherited-worker)
@@ -782,6 +798,7 @@ test_required_inputs_fail_clearly() {
 
 test_equal_count_wrong_identity
 test_remote_inventory_is_fetched_live
+test_registered_remote_route_id_is_configurable
 test_exact_live_worker_ownership_is_discovered
 test_remote_home_inventory_uses_host_local_owner_record
 test_local_registered_inventory_route_is_accepted
