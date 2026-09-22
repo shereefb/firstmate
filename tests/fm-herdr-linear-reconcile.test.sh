@@ -190,6 +190,10 @@ write_linear_curl() { # <case-dir>
 #!/usr/bin/env bash
 cards_file=${FM_TEST_LINEAR_CARDS_FILE:?}
 payload=
+if [ -n "${FM_TEST_LINEAR_CALL_COUNT:-}" ]; then
+  count=$(cat "$FM_TEST_LINEAR_CALL_COUNT" 2>/dev/null || echo 0)
+  printf '%s\n' "$((count + 1))" > "$FM_TEST_LINEAR_CALL_COUNT"
+fi
 authorization=$(cat /dev/fd/3) || exit 22
 [ "$authorization" = 'Authorization: secret' ] || exit 22
 for arg in "$@"; do
@@ -207,10 +211,16 @@ printf '%s' "$payload" | jq -e '
   and .variables.project == "project-os"
 ' >/dev/null || exit 22
 after=$(printf '%s' "$payload" | jq -r '.variables.after // ""')
-if [ "${FM_TEST_LINEAR_PAGINATED:-0}" = 1 ]; then
+if [ "${FM_TEST_LINEAR_PAGINATED:-0}" != 0 ]; then
   case "$after" in
     '') jq -c '{data:{issues:{nodes:(.cards[0:1] | map(.state = {name:.state})),pageInfo:{hasNextPage:true,endCursor:"cursor-1"}}}}' "$cards_file" ;;
-    cursor-1) jq -c '{data:{issues:{nodes:(.cards[1:] | map(.state = {name:.state})),pageInfo:{hasNextPage:false,endCursor:null}}}}' "$cards_file" ;;
+    cursor-1)
+      if [ "$FM_TEST_LINEAR_PAGINATED" = repeat ]; then
+        jq -c '{data:{issues:{nodes:[],pageInfo:{hasNextPage:true,endCursor:"cursor-1"}}}}' "$cards_file"
+      else
+        jq -c '{data:{issues:{nodes:(.cards[1:] | map(.state = {name:.state})),pageInfo:{hasNextPage:false,endCursor:null}}}}' "$cards_file"
+      fi
+      ;;
     *) exit 22 ;;
   esac
 else
@@ -552,7 +562,7 @@ test_live_remote_inventory_requires_complete_schema() {
 }
 
 test_linear_api_requires_project_and_reads_all_pages() {
-  local dir cards out rc
+  local dir cards out rc calls
   dir=$(make_case linear-api)
   cards="$dir/cards.json"
   printf '%s\n' '{"cards":[{"id":"card-api-1","identifier":"OS-101","state":"In Progress"},{"id":"card-api-2","identifier":"OS-102","state":"In Review"}]}' > "$cards"
@@ -579,11 +589,17 @@ test_linear_api_requires_project_and_reads_all_pages() {
     and ([.cards[].id] | sort) == ["card-api-1", "card-api-2"]
     and ([.findings[].kind] | all(. == "card-without-task-binding"))
   ' >/dev/null || fail "Linear API project scope or pagination drifted: $out"
+  calls="$dir/linear-call-count"
+  out=$(FM_TEST_LINEAR_PAGINATED=repeat FM_TEST_LINEAR_CALL_COUNT="$calls" \
+    run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "repeated Linear pagination cursor was accepted"
+  case "$out" in *'Linear API pagination cursor did not advance'*) ;; *) fail "repeated cursor diagnostic drifted: $out" ;; esac
+  [ "$(cat "$calls")" = 2 ] || fail "repeated cursor caused another Linear request"
   pass "Linear API requires project identity and consumes every page"
 }
 
 test_duplicate_ownership_and_endpoint_identity() {
-  local dir cards ownership endpoint cross_home cross_backend
+  local dir cards ownership endpoint cross_home cross_backend normalized
   dir=$(make_case duplicates)
   write_meta "$dir/home" worker-a p-working card-a
   write_meta "$dir/home" worker-b p-idle card-a
@@ -600,6 +616,17 @@ test_duplicate_ownership_and_endpoint_identity() {
   endpoint=$(run_reconcile "$dir" "$cards") || fail "duplicate endpoint reconciliation failed"
   printf '%s' "$endpoint" | jq -e '[.findings[].kind] | all(. == "duplicate-endpoint")' >/dev/null \
     || fail "duplicate endpoints were accepted: $endpoint"
+
+  printf '%s\n' '{"cards":[]}' > "$cards"
+  normalized=$(run_reconcile "$dir" "$cards") || fail "duplicate worker identity reconciliation failed"
+  printf '%s' "$normalized" | jq -e --arg home "$dir/home" '
+    .summary.workers == 1
+    and .findings == [{kind:"worker-without-applicable-card", task_id:"worker-a",
+      home:$home, backend:"herdr", endpoint:"jarvis:p-shared",
+      detail:"worker does not have an applicable In Progress or In Review card"}]
+  ' >/dev/null || fail "worker identity was counted or reported by task record: $normalized"
+
+  printf '%s\n' '{"cards":[{"id":"card-a","identifier":"OS-1","state":"In Progress"},{"id":"card-b","identifier":"OS-2","state":"In Progress"}]}' > "$cards"
 
   rm -f "$dir/home/state"/*.meta
   write_meta "$dir/home" worker-a p-shared card-a
@@ -640,6 +667,24 @@ test_unrelated_worker_and_missing_endpoint() {
   pass "only running workers contribute to counts and unbound findings"
 }
 
+test_unbound_unresolved_worker_requires_deep_check() {
+  local dir cards out
+  dir=$(make_case unresolved-worker)
+  cards="$dir/cards.json"
+  printf '%s\n' '{"cards":[]}' > "$cards"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[{"task_id":"uncertain","linear_card_id":"","backend":"herdr","endpoint":"zeus:p-uncertain","herdr_session":"zeus","herdr_pane_id":"p-uncertain","endpoint_status":"unreadable"}]}' > "$dir/zeus-live.json"
+  out=$(run_reconcile "$dir" "$cards") || fail "unresolved worker reconciliation failed"
+  printf '%s' "$out" | jq -e '
+    .summary == {cards:0, workers:0, matched:0, needs_deep_check:1}
+    and .findings[0].kind == "needs-deep-check"
+    and .findings[0].task_id == "uncertain"
+    and .findings[0].home == "/remote/zeus-home"
+    and .findings[0].backend == "herdr"
+    and .findings[0].endpoint == "zeus:p-uncertain"
+  ' >/dev/null || fail "unbound unresolved worker produced a false clean result: $out"
+  pass "unbound unresolved workers require deep inspection"
+}
+
 test_non_applicable_columns_do_not_cover_workers() {
   local dir cards out
   dir=$(make_case non-applicable-column)
@@ -654,7 +699,7 @@ test_non_applicable_columns_do_not_cover_workers() {
 }
 
 test_required_inputs_fail_clearly() {
-  local dir cards out rc
+  local dir cards out rc saved_state
   dir=$(make_case unavailable)
   cards="$dir/cards.json"
   printf '%s\n' '{"cards":[]}' > "$cards"
@@ -677,6 +722,22 @@ test_required_inputs_fail_clearly() {
   out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --linear-api --json 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "removed --json output mode succeeded"
   case "$out" in *'usage: fm-herdr-linear-reconcile.sh'*) ;; *) fail "removed --json mode did not return usage: $out" ;; esac
+  chmod 0600 "$dir/home/state"
+  out=$(run_inventory "$dir" "$dir/home" 2>&1) && rc=0 || rc=$?
+  chmod 0700 "$dir/home/state"
+  [ "$rc" -ne 0 ] || fail "unsearchable inventory state directory was accepted"
+  case "$out" in *'inventory state directory is unavailable'*) ;; *) fail "unsearchable state diagnostic drifted: $out" ;; esac
+  saved_state="$dir/home/state.saved"
+  mv "$dir/home/state" "$saved_state"
+  out=$(run_inventory "$dir" "$dir/home" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "missing inventory state directory was treated as empty"
+  case "$out" in *'inventory state directory is unavailable'*) ;; *) fail "missing state diagnostic drifted: $out" ;; esac
+  ln -s "$saved_state" "$dir/home/state"
+  out=$(run_inventory "$dir" "$dir/home" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "symlinked inventory state directory was accepted"
+  case "$out" in *'inventory state directory is unavailable'*) ;; *) fail "symlinked state diagnostic drifted: $out" ;; esac
+  rm "$dir/home/state"
+  mv "$saved_state" "$dir/home/state"
   pass "comparison requires a registered Zeus route and rejects caller inputs"
 }
 
@@ -687,6 +748,7 @@ test_remote_home_inventory_uses_host_local_owner_record
 test_local_registered_inventory_route_is_accepted
 test_duplicate_ownership_and_endpoint_identity
 test_unrelated_worker_and_missing_endpoint
+test_unbound_unresolved_worker_requires_deep_check
 test_non_applicable_columns_do_not_cover_workers
 test_process_liveness_outranks_recorded_agent_status
 test_empty_card_identities_are_rejected

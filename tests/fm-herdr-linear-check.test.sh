@@ -72,20 +72,28 @@ out=$(FM_HOME="$HOME_DIR" FM_HERDR_LINEAR_CHECK_NOW=1200 "$CHECK" check) || fail
 [ "$(cat "$HOME_DIR/state/fake-count")" = 1 ] || fail "cadence gate invoked reconciliation early"
 
 out=$(FM_HOME="$HOME_DIR" FM_HERDR_LINEAR_CHECK_NOW=1900 "$CHECK" check) || fail "mismatch check failed"
-[ "$out" = 'Operating Studio reconciliation needs deep inspection: 2 discrepancy(s); run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard' ] \
+[ "$out" = 'Operating Studio reconciliation needs deep inspection: 2 discrepancy(s); run bin/fm-herdr-linear-check.sh inspect from buildboard' ] \
   || fail "mismatch did not emit one actionable line: $out"
 pass "check is silent on match and reports mismatch every due interval"
 
+out=$(FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$OTHER_STATE" "$CHECK" inspect) \
+  || fail "one-shot inspection failed"
+[ "$out" = '{"schema":"fm-herdr-linear-reconcile.v1","summary":{"needs_deep_check":2}}' ] \
+  || fail "one-shot inspection did not print the reconciliation result: $out"
+[ "$(cat "$HOME_DIR/state/fake-env")" = "read-only-secret|team-os|project-os|$HOME_DIR/state|$PRIMARY_HOME/data" ] \
+  || fail "one-shot inspection bypassed buildboard configuration or the primary route"
+pass "one-shot inspection uses buildboard configuration and primary routing"
+
 printf '%s\n' fail > "$HOME_DIR/state/fake-mode"
 out=$(FM_HOME="$HOME_DIR" FM_HERDR_LINEAR_CHECK_NOW=2800 "$CHECK" check) || fail "failure check did not preserve watcher contract"
-[ "$out" = 'Operating Studio reconciliation check failed: live Zeus inventory unavailable; run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard' ] \
+[ "$out" = 'Operating Studio reconciliation check failed: live Zeus inventory unavailable; run bin/fm-herdr-linear-check.sh inspect from buildboard' ] \
   || fail "failure did not emit one actionable line: $out"
 [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 1 ] || fail "failure emitted more than one line"
 pass "check converts reconciliation failure into one actionable line"
 
 printf '%s\n' hang > "$HOME_DIR/state/fake-mode"
 out=$(FM_HOME="$HOME_DIR" FM_CHECK_TIMEOUT=4 FM_HERDR_LINEAR_CHECK_NOW=3700 "$CHECK" check) || fail "bounded check did not preserve watcher contract"
-[ "$out" = 'Operating Studio reconciliation check failed: reconciliation exceeded its 1-second internal budget; run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard' ] \
+[ "$out" = 'Operating Studio reconciliation check failed: reconciliation exceeded its 1-second internal budget; run bin/fm-herdr-linear-check.sh inspect from buildboard' ] \
   || fail "timeout did not emit one actionable line: $out"
 for artifact in "$HOME_DIR/state"/.fm-herdr-linear-output.* "$HOME_DIR/state"/.fm-herdr-linear-error.*; do
   [ ! -e "$artifact" ] || fail "timeout left private temporary state: $artifact"

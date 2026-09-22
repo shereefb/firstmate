@@ -4,6 +4,7 @@
 # Usage:
 #   fm-herdr-linear-check.sh [check]
 #   fm-herdr-linear-check.sh arm
+#   fm-herdr-linear-check.sh inspect
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,6 +48,7 @@ usage() {
 Usage:
   fm-herdr-linear-check.sh [check]   reconcile when the 15-minute interval is due
   fm-herdr-linear-check.sh arm       arm the trusted buildboard custom check
+  fm-herdr-linear-check.sh inspect   print one fresh reconciliation result
 EOF
 }
 
@@ -175,19 +177,40 @@ action_check() {
       detail=$(sed -n '/./{p;q;}' "$ERROR_FILE")
       [ -n "$detail" ] || detail="reconciliation exited $rc without a diagnostic"
     fi
-    line="Operating Studio reconciliation check failed: $(one_line "$detail"); run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard"
+    line="Operating Studio reconciliation check failed: $(one_line "$detail"); run bin/fm-herdr-linear-check.sh inspect from buildboard"
   elif ! count=$(jq -er '
       select(.schema == "fm-herdr-linear-reconcile.v1")
       | .summary.needs_deep_check
       | select(type == "number" and . >= 0 and floor == .)
     ' "$OUTPUT_FILE" 2>/dev/null); then
-    line='Operating Studio reconciliation check failed: reconciliation returned an invalid result; run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard'
+    line='Operating Studio reconciliation check failed: reconciliation returned an invalid result; run bin/fm-herdr-linear-check.sh inspect from buildboard'
   elif [ "$count" -gt 0 ]; then
-    line="Operating Studio reconciliation needs deep inspection: $count discrepancy(s); run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard"
+    line="Operating Studio reconciliation needs deep inspection: $count discrepancy(s); run bin/fm-herdr-linear-check.sh inspect from buildboard"
   fi
   cleanup
   finish_check "$now" "$line"
   return 0
+}
+
+action_inspect() {
+  local primary_data
+  owner_valid || {
+    printf '%s\n' 'fm-herdr-linear-check: only the persistent buildboard home may inspect this reconciliation' >&2
+    return 1
+  }
+  primary_data=$(primary_data_dir) || {
+    printf '%s\n' 'fm-herdr-linear-check: buildboard needs a valid local parent binding to the primary Zeus registry' >&2
+    return 1
+  }
+  load_linear_config || {
+    printf 'fm-herdr-linear-check: buildboard Linear configuration is incomplete in %s\n' "$ENV_FILE" >&2
+    return 1
+  }
+  LINEAR_API_KEY="$LINEAR_READONLY_API_KEY" \
+    FM_LINEAR_OPERATING_STUDIO_TEAM_ID="$LINEAR_TEAM_ID" \
+    FM_LINEAR_OPERATING_STUDIO_PROJECT_ID="$LINEAR_PROJECT_ID" \
+    FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$primary_data" \
+    exec "$SCRIPT_DIR/fm-herdr-linear-reconcile.sh" --linear-api
 }
 
 shim_content() {
@@ -246,6 +269,7 @@ action_arm() {
 case "${1:-check}" in
   check) action_check ;;
   arm) action_arm ;;
+  inspect) action_inspect ;;
   -h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

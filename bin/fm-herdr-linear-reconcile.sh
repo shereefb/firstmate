@@ -326,6 +326,10 @@ discover_live_workers() { # <rows>
 local_inventory() {
   local rows="$TMP/local.rows" live_rows="$TMP/local-live.rows"
   local meta id kind backend endpoint card session pane status value
+  [ -d "$STATE" ] && [ ! -L "$STATE" ] && [ -r "$STATE" ] && [ -x "$STATE" ] || {
+    echo "fm-herdr-linear-reconcile: inventory state directory is unavailable: $STATE" >&2
+    return 1
+  }
   : > "$rows"
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] && [ ! -L "$meta" ] || continue
@@ -462,6 +466,7 @@ command -v curl >/dev/null 2>&1 || {
     exit 1
   }
   printf '%s\n' '[]' > "$TMP/linear-cards.json"
+  : > "$TMP/linear-cursors"
   cursor=
   while :; do
     payload=$(jq -cn \
@@ -490,6 +495,11 @@ command -v curl >/dev/null 2>&1 || {
     mv "$TMP/linear-cards.next.json" "$TMP/linear-cards.json"
     [ "$(jq -r '.data.issues.pageInfo.hasNextPage' "$TMP/linear-api.json")" = true ] || break
     cursor=$(jq -r '.data.issues.pageInfo.endCursor' "$TMP/linear-api.json")
+    if grep -Fqx -- "$cursor" "$TMP/linear-cursors"; then
+      echo 'fm-herdr-linear-reconcile: Linear API pagination cursor did not advance' >&2
+      exit 1
+    fi
+    printf '%s\n' "$cursor" >> "$TMP/linear-cursors"
   done
   jq -e '
     map({id:(.id // ""), identifier:(.identifier // ""),
@@ -509,7 +519,10 @@ command -v curl >/dev/null 2>&1 || {
 REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.json" --slurpfile cards "$TMP/cards.json" '
   ([ $local[0].children[] | . + {home:$local[0].home} ]
    + [ $zeus[0].children[] | . + {home:$zeus[0].home} ]) as $records
-  | [ $records[] | select(.backend == "herdr" and .endpoint_status == "alive") ] as $workers
+  | ([ $records[] | select(.backend == "herdr" and .endpoint_status == "alive") ]
+      | sort_by(.home, .backend, .endpoint, .task_id)
+      | group_by([.home, .backend, .endpoint])
+      | map(.[0])) as $workers
   | $cards[0] as $cards
   | [ $records[] | select(.endpoint != "")
       | {key:[.home, .backend, .endpoint]} ]
@@ -526,35 +539,57 @@ REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.j
            detail:"no recorded Firstmate task binding"}
         elif ($bound | length) > 1 then
           {kind:"duplicate-ownership", card_id:$card.id, identifier:$card.identifier,
-           task_ids:($bound | map(.task_id)), detail:"multiple tasks claim this card"}
+           task_ids:($bound | map(.task_id)),
+           workers:($bound | map({task_id, home, backend, endpoint})),
+           detail:"multiple tasks claim this card"}
         else $bound[0] as $worker
           | if any($duplicate_endpoint_keys[]; . == [$worker.home, $worker.backend, $worker.endpoint]) then
               {kind:"duplicate-endpoint", card_id:$card.id, identifier:$card.identifier,
-               task_id:$worker.task_id, endpoint:$worker.endpoint,
+               task_id:$worker.task_id, home:$worker.home, backend:$worker.backend,
+               endpoint:$worker.endpoint,
                detail:"the recorded endpoint belongs to multiple tasks"}
             elif $worker.backend != "herdr" then
               {kind:"needs-deep-check", card_id:$card.id, identifier:$card.identifier,
-               task_id:$worker.task_id, detail:"the recorded task is not Herdr-backed"}
+               task_id:$worker.task_id, home:$worker.home, backend:$worker.backend,
+               endpoint:$worker.endpoint, detail:"the recorded task is not Herdr-backed"}
             elif $worker.endpoint_status == "missing" then
               {kind:"missing-endpoint", card_id:$card.id, identifier:$card.identifier,
-               task_id:$worker.task_id, endpoint:$worker.endpoint,
+               task_id:$worker.task_id, home:$worker.home, backend:$worker.backend,
+               endpoint:$worker.endpoint,
                detail:"Herdr has no agent for the recorded endpoint"}
             elif $worker.endpoint_status != "alive" then
               {kind:"needs-deep-check", card_id:$card.id, identifier:$card.identifier,
-               task_id:$worker.task_id, endpoint:$worker.endpoint,
+               task_id:$worker.task_id, home:$worker.home, backend:$worker.backend,
+               endpoint:$worker.endpoint,
                detail:("Herdr cannot prove a live worker (endpoint status " + $worker.endpoint_status + ")")}
             else
               {kind:"matched-live-endpoint", card_id:$card.id, identifier:$card.identifier,
-               task_id:$worker.task_id, endpoint:$worker.endpoint,
+               task_id:$worker.task_id, home:$worker.home, backend:$worker.backend,
+               endpoint:$worker.endpoint,
                detail:"recorded Herdr endpoint has a live agent process"}
             end
         end
     ] as $card_findings
   | [ $workers[] as $worker
-      | select(($worker.linear_card_id | length) == 0 or ([ $cards[] | select(.id == $worker.linear_card_id) ] | length) == 0)
+      | select(([ $records[] as $record
+          | select($record.home == $worker.home and $record.backend == $worker.backend
+              and $record.endpoint == $worker.endpoint
+              and any($cards[]; .id == $record.linear_card_id)) ] | length) == 0)
       | {kind:"worker-without-applicable-card", task_id:$worker.task_id,
-         endpoint:$worker.endpoint, detail:"worker does not have an applicable In Progress or In Review card"}
+         home:$worker.home, backend:$worker.backend, endpoint:$worker.endpoint,
+         detail:"worker does not have an applicable In Progress or In Review card"}
     ] as $worker_findings
+  | [ $records[] as $worker
+      | select($worker.backend == "herdr")
+      | select($worker.endpoint_status != "alive" and $worker.endpoint_status != "dead"
+          and $worker.endpoint_status != "missing")
+      | select(($worker.linear_card_id | length) == 0
+          or (any($cards[]; .id == $worker.linear_card_id) | not))
+      | {kind:"needs-deep-check", task_id:$worker.task_id,
+         home:$worker.home, backend:$worker.backend, endpoint:$worker.endpoint,
+         detail:("Herdr cannot establish liveness for an unbound worker record (endpoint status "
+           + $worker.endpoint_status + ")")}
+    ] as $unresolved_findings
   | [ $local[0], $zeus[0]
       | select(.ownership_status == "needs-deep-check")
       | {kind:"needs-deep-check", home:.home,
@@ -562,11 +597,11 @@ REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.j
     ] as $inventory_findings
   | {schema:"fm-herdr-linear-reconcile.v1", local_inventory:$local[0], zeus_inventory:$zeus[0],
      cards:$cards,
-     findings:(($card_findings + $worker_findings + $inventory_findings)
+     findings:(($card_findings + $worker_findings + $unresolved_findings + $inventory_findings)
        | sort_by(.kind, (.home // ""), (.card_id // ""), (.task_id // ""))),
      summary:{cards:($cards | length), workers:($workers | length),
               matched:([$card_findings[] | select(.kind == "matched-live-endpoint")] | length),
-              needs_deep_check:([($card_findings + $worker_findings + $inventory_findings)[]
+              needs_deep_check:([($card_findings + $worker_findings + $unresolved_findings + $inventory_findings)[]
                 | select(.kind != "matched-live-endpoint")] | length)}}
 ')
 

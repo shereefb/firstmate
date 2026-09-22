@@ -229,6 +229,7 @@ API mode refuses to run without both identities, filters by both, and reads ever
 The command always emits one JSON object that names exact identity, verified-live-worker count, duplicate, and home-scoped endpoint discrepancies as well as `needs-deep-check` results.
 The persistent `buildboard` secondmate is the sole automatic owner.
 Put its read-only Linear credential and the two Operating Studio identities in that home's gitignored `.env`, then run `bin/fm-herdr-linear-check.sh arm` from that local secondmate home.
+Run `bin/fm-herdr-linear-check.sh inspect` there for a fresh one-shot result through the same configuration and primary registry route.
 The check reads those three values fresh from `.env`, resolves the primary from buildboard's durable parent binding, and uses only the primary's registered Zeus route for each fresh inventory.
 Each inventory joins workers from every exact flat workspace proven by the owning secondmate's registered record, current live endpoint, or a version 2 projection binding for the physical home.
 An owner workspace move does not create a discrepancy by itself because the inventory enumerates both the registered and current workspaces; an unavailable or ambiguous ownership read fails closed instead of returning a partial match.
