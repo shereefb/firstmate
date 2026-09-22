@@ -6,7 +6,7 @@
 #   fm-herdr-linear-reconcile.sh --linear-api
 #
 # `--inventory` is run by each owning home. It joins direct child metadata with
-# its exact registered launcher workspace and exact home-bound projections.
+# exact workspaces proven by its registered owner, live owner, or projections.
 # A parent receives a fresh secondmate inventory through its registered route;
 # it never enumerates the secondmate's panes itself.
 # The comparison joins a Linear issue's immutable `id` to `linear_card_id=` in
@@ -133,9 +133,11 @@ resolve_inventory_owner() {
   local owner meta recorded_home canonical_home canonical_recorded status pane_out owner_location
   local workspaces_out tabs_out
   INVENTORY_OWNER_SESSION=
+  INVENTORY_OWNER_REGISTERED_WORKSPACE=
   INVENTORY_OWNER_WORKSPACE=
   INVENTORY_OWNER_TAB=
   INVENTORY_OWNER_PANE=
+  INVENTORY_OWNERSHIP_STATUS=verified
   if [ -e "$marker" ] || [ -L "$marker" ]; then
     [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
     owner=$(cat "$marker" 2>/dev/null) || return 1
@@ -155,13 +157,15 @@ resolve_inventory_owner() {
     fm_backend_validate_task_endpoint "$meta" "$owner" 2>/dev/null || return 1
     [ "$FM_BACKEND_VALIDATED_BACKEND" = herdr ] || return 1
     INVENTORY_OWNER_SESSION=$(meta_value "$meta" herdr_session)
+    INVENTORY_OWNER_REGISTERED_WORKSPACE=$(meta_value "$meta" herdr_workspace_id)
     INVENTORY_OWNER_PANE=$(meta_value "$meta" herdr_pane_id)
     [ "$FM_BACKEND_VALIDATED_TARGET" = "$INVENTORY_OWNER_SESSION:$INVENTORY_OWNER_PANE" ] \
-      || return 1
+      && [ -n "$INVENTORY_OWNER_REGISTERED_WORKSPACE" ] || return 1
   else
     INVENTORY_OWNER_SESSION=$(fm_backend_herdr_session)
     fm_backend_herdr_launcher_identity "$INVENTORY_OWNER_SESSION" && status=0 || status=$?
     [ "$status" -eq 0 ] || return 1
+    INVENTORY_OWNER_REGISTERED_WORKSPACE=${HERDR_WORKSPACE_ID:-}
     INVENTORY_OWNER_PANE=$FM_BACKEND_HERDR_LAUNCHER_PANE_ID
   fi
   [ "$(fm_backend_agent_state herdr "$INVENTORY_OWNER_SESSION:$INVENTORY_OWNER_PANE")" = alive ] \
@@ -178,6 +182,16 @@ resolve_inventory_owner() {
   ') || return 1
   IFS=$'\t' read -r INVENTORY_OWNER_WORKSPACE INVENTORY_OWNER_TAB <<< "$owner_location"
   [ -n "$INVENTORY_OWNER_WORKSPACE" ] && [ -n "$INVENTORY_OWNER_TAB" ] || return 1
+  if [ -z "$INVENTORY_OWNER_REGISTERED_WORKSPACE" ]; then
+    INVENTORY_OWNER_REGISTERED_WORKSPACE=$INVENTORY_OWNER_WORKSPACE
+  elif [ "$INVENTORY_OWNER_REGISTERED_WORKSPACE" != "$INVENTORY_OWNER_WORKSPACE" ]; then
+    INVENTORY_OWNERSHIP_STATUS=needs-deep-check
+  fi
+  safe_field "$INVENTORY_OWNER_SESSION" \
+    && safe_field "$INVENTORY_OWNER_REGISTERED_WORKSPACE" \
+    && safe_field "$INVENTORY_OWNER_WORKSPACE" \
+    && safe_field "$INVENTORY_OWNER_TAB" \
+    && safe_field "$INVENTORY_OWNER_PANE" || return 1
   workspaces_out=$(fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" workspace list 2>/dev/null) \
     || return 1
   printf '%s' "$workspaces_out" | jq -e --arg workspace "$INVENTORY_OWNER_WORKSPACE" '
@@ -192,50 +206,75 @@ resolve_inventory_owner() {
   ' >/dev/null 2>&1
 }
 
-discover_owned_flat_workers() { # <rows>
-  local rows=$1 tabs panes pane task_id
-  resolve_inventory_owner || {
-    echo 'fm-herdr-linear-reconcile: could not verify the inventory home Herdr owner' >&2
-    return 1
-  }
-  tabs="$TMP/herdr-inherited-tabs.json"
-  panes="$TMP/herdr-inherited-panes.json"
-  if ! fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" tab list \
-      --workspace "$INVENTORY_OWNER_WORKSPACE" > "$tabs" 2>/dev/null \
-    || ! jq -e '(.result.tabs | type) == "array" and all(.result.tabs[]?;
-      (.tab_id | type) == "string" and (.tab_id | length) > 0
-      and (.label | type) == "string")' "$tabs" >/dev/null 2>&1 \
-    || ! fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" pane list \
-      --workspace "$INVENTORY_OWNER_WORKSPACE" > "$panes" 2>/dev/null \
-    || ! jq -e --arg owner_pane "$INVENTORY_OWNER_PANE" \
-      --arg owner_tab "$INVENTORY_OWNER_TAB" '
-      (.result.panes | type) == "array" and all(.result.panes[]?;
-      (.pane_id | type) == "string" and (.pane_id | length) > 0
-      and (.tab_id | type) == "string" and (.tab_id | length) > 0)
-      and ([.result.panes[] | select(.pane_id == $owner_pane)] | length) == 1
-      and any(.result.panes[];
-        .pane_id == $owner_pane and .tab_id == $owner_tab)
-    ' "$panes" >/dev/null 2>&1; then
-    echo "fm-herdr-linear-reconcile: could not enumerate inventory Herdr workspace $INVENTORY_OWNER_WORKSPACE" >&2
-    return 1
-  fi
-  while IFS=$'\t' read -r pane task_id; do
-    [ -n "$pane" ] || continue
-    append_live_worker "$rows" "$task_id" "$INVENTORY_OWNER_SESSION" "$pane" || return 1
-  done < <(jq -r --slurpfile panes "$panes" --arg owner_pane "$INVENTORY_OWNER_PANE" '
-    .result.tabs[]
-    | select(.label | startswith("fm-") and length > 3)
-    | . as $tab
-    | $panes[0].result.panes[]
-    | select(.tab_id == $tab.tab_id)
-    | select(.pane_id != $owner_pane)
-    | [.pane_id, $tab.label[3:]]
-    | @tsv
-  ' "$tabs")
+discover_owned_flat_workers() { # <rows> <workspaces>
+  local rows=$1 workspaces=$2 session workspace workspaces_out matches current owner_session
+  local tabs panes pane task_id index=0
+  while IFS=$'\t' read -r session workspace; do
+    [ -n "$session" ] && [ -n "$workspace" ] || continue
+    workspaces_out=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null) || return 1
+    matches=$(printf '%s' "$workspaces_out" | jq -er --arg workspace "$workspace" '
+      .result.workspaces
+      | select(type == "array")
+      | [.[] | select(.workspace_id == $workspace)]
+      | length
+    ' 2>/dev/null) || return 1
+    current=0
+    [ "$session" != "$INVENTORY_OWNER_SESSION" ] \
+      || [ "$workspace" != "$INVENTORY_OWNER_WORKSPACE" ] || current=1
+    if [ "$matches" -eq 0 ]; then
+      [ "$current" -eq 0 ] || return 1
+      continue
+    fi
+    [ "$matches" -eq 1 ] || return 1
+    owner_session=0
+    [ "$session" != "$INVENTORY_OWNER_SESSION" ] || owner_session=1
+    index=$((index + 1))
+    tabs="$TMP/herdr-owned-tabs.$index.json"
+    panes="$TMP/herdr-owned-panes.$index.json"
+    if ! fm_backend_herdr_cli "$session" tab list \
+        --workspace "$workspace" > "$tabs" 2>/dev/null \
+      || ! jq -e '(.result.tabs | type) == "array" and all(.result.tabs[]?;
+        (.tab_id | type) == "string" and (.tab_id | length) > 0
+        and (.label | type) == "string")' "$tabs" >/dev/null 2>&1 \
+      || ! fm_backend_herdr_cli "$session" pane list \
+        --workspace "$workspace" > "$panes" 2>/dev/null \
+      || ! jq -e --argjson current "$current" --argjson owner_session "$owner_session" \
+        --arg owner_pane "$INVENTORY_OWNER_PANE" \
+        --arg owner_tab "$INVENTORY_OWNER_TAB" '
+        (.result.panes | type) == "array" and all(.result.panes[]?;
+        (.pane_id | type) == "string" and (.pane_id | length) > 0
+        and (.tab_id | type) == "string" and (.tab_id | length) > 0)
+        and if $current == 1 then
+          ([.result.panes[] | select(.pane_id == $owner_pane)] | length) == 1
+          and any(.result.panes[];
+            .pane_id == $owner_pane and .tab_id == $owner_tab)
+        elif $owner_session == 1 then
+          ([.result.panes[] | select(.pane_id == $owner_pane)] | length) == 0
+        else true
+        end
+      ' "$panes" >/dev/null 2>&1; then
+      echo "fm-herdr-linear-reconcile: could not enumerate inventory Herdr workspace $workspace" >&2
+      return 1
+    fi
+    while IFS=$'\t' read -r pane task_id; do
+      [ -n "$pane" ] || continue
+      append_live_worker "$rows" "$task_id" "$session" "$pane" || return 1
+    done < <(jq -r --slurpfile panes "$panes" --argjson owner_session "$owner_session" \
+      --arg owner_pane "$INVENTORY_OWNER_PANE" '
+      .result.tabs[]
+      | select(.label | startswith("fm-") and length > 3)
+      | . as $tab
+      | $panes[0].result.panes[]
+      | select(.tab_id == $tab.tab_id)
+      | select($owner_session == 0 or .pane_id != $owner_pane)
+      | [.pane_id, $tab.label[3:]]
+      | @tsv
+    ' "$tabs")
+  done < "$workspaces"
 }
 
-discover_projected_workers() { # <rows>
-  local rows=$1 canonical_home journal task_id
+discover_projected_workers() { # <rows> <workspaces>
+  local rows=$1 workspaces=$2 canonical_home journal task_id
   canonical_home=$(fm_backend_herdr_projection_home_identity "$FM_HOME") || {
     echo 'fm-herdr-linear-reconcile: could not resolve the inventory home identity' >&2
     return 1
@@ -262,15 +301,28 @@ discover_projected_workers() { # <rows>
         echo "fm-herdr-linear-reconcile: projection binding is unavailable for task $task_id" >&2
         return 1
       }
+    printf '%s\t%s\n' \
+      "$FM_BACKEND_HERDR_JOURNAL_SESSION" \
+      "$FM_BACKEND_HERDR_JOURNAL_PARENT_WORKSPACE_ID" >> "$workspaces"
     append_live_worker "$rows" "$task_id" "$FM_BACKEND_HERDR_JOURNAL_SESSION" \
       "$FM_BACKEND_HERDR_JOURNAL_PANE_ID" || return 1
   done
 }
 
 discover_live_workers() { # <rows>
+  local workspaces="$TMP/herdr-owned-workspaces"
   : > "$1"
-  discover_owned_flat_workers "$1" || return 1
-  discover_projected_workers "$1"
+  : > "$workspaces"
+  resolve_inventory_owner || {
+    echo 'fm-herdr-linear-reconcile: could not verify the inventory home Herdr owner' >&2
+    return 1
+  }
+  printf '%s\t%s\n%s\t%s\n' \
+    "$INVENTORY_OWNER_SESSION" "$INVENTORY_OWNER_REGISTERED_WORKSPACE" \
+    "$INVENTORY_OWNER_SESSION" "$INVENTORY_OWNER_WORKSPACE" >> "$workspaces"
+  discover_projected_workers "$1" "$workspaces" || return 1
+  sort -u -o "$workspaces" "$workspaces" || return 1
+  discover_owned_flat_workers "$1" "$workspaces"
 }
 
 local_inventory() {
@@ -320,14 +372,15 @@ local_inventory() {
      | {task_id:.[0], linear_card_id:.[1], backend:.[2], endpoint:.[3],
         herdr_session:.[4], herdr_pane_id:.[5], endpoint_status:.[6]}]
   ' < "$live_rows" > "$TMP/local-live.json"
-  jq -n --arg home "$FM_HOME" \
+  jq -n --arg home "$FM_HOME" --arg ownership_status "$INVENTORY_OWNERSHIP_STATUS" \
     --slurpfile records "$TMP/local-records.json" --slurpfile live "$TMP/local-live.json" '
     ($records[0] + [ $live[0][] as $worker
         | select(any($records[0][];
             .task_id == $worker.task_id and .backend == "herdr" and .endpoint == $worker.endpoint) | not)
         | $worker ])
     | sort_by(.task_id, .backend, .endpoint)
-    | {schema:"fm-herdr-linear-inventory.v1", home:$home, children:.}
+    | {schema:"fm-herdr-linear-inventory.v1", home:$home,
+       ownership_status:$ownership_status, children:.}
   '
 }
 
@@ -363,6 +416,7 @@ fi
 jq -e '
   .schema == "fm-herdr-linear-inventory.v1"
   and ((.home | type) == "string" and (.home | length) > 0)
+  and (.ownership_status == "verified" or .ownership_status == "needs-deep-check")
   and (.children | type) == "array"
   and all(.children[]?;
     ((.task_id | type) == "string" and (.task_id | length) > 0)
@@ -503,12 +557,19 @@ REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.j
       | {kind:"worker-without-applicable-card", task_id:$worker.task_id,
          endpoint:$worker.endpoint, detail:"worker does not have an applicable In Progress or In Review card"}
     ] as $worker_findings
+  | [ $local[0], $zeus[0]
+      | select(.ownership_status == "needs-deep-check")
+      | {kind:"needs-deep-check", home:.home,
+         detail:"the registered owner moved workspaces, so unrecorded flat-worker ownership needs inspection"}
+    ] as $inventory_findings
   | {schema:"fm-herdr-linear-reconcile.v1", local_inventory:$local[0], zeus_inventory:$zeus[0],
      cards:$cards,
-     findings:(($card_findings + $worker_findings) | sort_by(.kind, (.card_id // ""), (.task_id // ""))),
+     findings:(($card_findings + $worker_findings + $inventory_findings)
+       | sort_by(.kind, (.home // ""), (.card_id // ""), (.task_id // ""))),
      summary:{cards:($cards | length), workers:($workers | length),
               matched:([$card_findings[] | select(.kind == "matched-live-endpoint")] | length),
-              needs_deep_check:([($card_findings + $worker_findings)[] | select(.kind != "matched-live-endpoint")] | length)}}
+              needs_deep_check:([($card_findings + $worker_findings + $inventory_findings)[]
+                | select(.kind != "matched-live-endpoint")] | length)}}
 ')
 
 printf '%s\n' "$REPORT"

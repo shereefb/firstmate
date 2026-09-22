@@ -43,7 +43,7 @@ case "${1:-} ${2:-}" in
       moved) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-moved","label":"firstmate"}]}}' ;;
       ambiguous-owner) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-moved","label":"firstmate"}]}}' ;;
       zeus) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-zeus","label":"firstmate"}]}}' ;;
-      zeus-moved) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-zeus-moved","label":"firstmate"}]}}' ;;
+      zeus-moved) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-zeus","label":"firstmate"},{"workspace_id":"w-zeus-moved","label":"firstmate"}]}}' ;;
       *) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"}]}}' ;;
     esac
     ;;
@@ -51,9 +51,12 @@ case "${1:-} ${2:-}" in
     case "$mode:$workspace" in
       inherited:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"fm-buildboard"},{"tab_id":"t-unrecorded","label":"fm-unrecorded"}]}}' ;;
       inherited:w-foreign) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-foreign","label":"fm-foreign"}]}}' ;;
-      moved:w-moved|ambiguous-owner:w-moved) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-moved","label":"fm-renamed-owner"},{"tab_id":"t-moved-worker","label":"fm-moved-worker"}]}}' ;;
+      moved:w-moved|ambiguous-owner:w-moved) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-moved","label":"fm-renamed-owner"}]}}' ;;
+      moved:w-owned|ambiguous-owner:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-moved-worker","label":"fm-moved-worker"}]}}' ;;
       zeus:w-zeus) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus","label":"fm-zeus"},{"tab_id":"t-zeus-worker","label":"fm-zeus-worker"}]}}' ;;
-      zeus-moved:w-zeus-moved) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus-moved","label":"fm-renamed-zeus"},{"tab_id":"t-zeus-worker","label":"fm-zeus-worker"}]}}' ;;
+      zeus-moved:w-zeus-moved) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus-moved","label":"fm-renamed-zeus"}]}}' ;;
+      zeus-moved:w-zeus) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus-worker","label":"fm-zeus-worker"}]}}' ;;
+      projection:w-parent) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-parent-flat","label":"fm-parent-flat"}]}}' ;;
       projection:w-projected) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-projected","label":"fm-projected"}]}}' ;;
       *:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"fm-buildboard"}]}}' ;;
       *:w-zeus) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus","label":"fm-zeus"}]}}' ;;
@@ -64,10 +67,13 @@ case "${1:-} ${2:-}" in
     case "$mode:$workspace" in
       inherited:w-owned) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-launch"},{"pane_id":"p-unrecorded","tab_id":"t-unrecorded"}]}}' ;;
       inherited:w-foreign) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-foreign","tab_id":"t-foreign"}]}}' ;;
-      moved:w-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-moved"},{"pane_id":"p-moved-worker","tab_id":"t-moved-worker"}]}}' ;;
-      ambiguous-owner:w-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-moved"},{"pane_id":"p-launch","tab_id":"t-moved"},{"pane_id":"p-moved-worker","tab_id":"t-moved-worker"}]}}' ;;
+      moved:w-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-moved"}]}}' ;;
+      moved:w-owned|ambiguous-owner:w-owned) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-moved-worker","tab_id":"t-moved-worker"}]}}' ;;
+      ambiguous-owner:w-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-moved"},{"pane_id":"p-launch","tab_id":"t-moved"}]}}' ;;
       zeus:w-zeus) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus","tab_id":"t-zeus"},{"pane_id":"p-zeus-worker","tab_id":"t-zeus-worker"}]}}' ;;
-      zeus-moved:w-zeus-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus","tab_id":"t-zeus-moved"},{"pane_id":"p-zeus-worker","tab_id":"t-zeus-worker"}]}}' ;;
+      zeus-moved:w-zeus-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus","tab_id":"t-zeus-moved"}]}}' ;;
+      zeus-moved:w-zeus) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus-worker","tab_id":"t-zeus-worker"}]}}' ;;
+      projection:w-parent) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-parent-flat","tab_id":"t-parent-flat"}]}}' ;;
       projection:w-projected) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-projected","tab_id":"t-projected"}]}}' ;;
       *:w-owned) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-launch"}]}}' ;;
       *:w-zeus) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus","tab_id":"t-zeus"}]}}' ;;
@@ -104,7 +110,7 @@ case "${1:-} ${2:-}" in
     ;;
   'agent get')
     case "${3:-}" in
-      p-launch|p-zeus|p-zeus-worker|p-working|p-review|p-shared|p-stale|p-unrecorded|p-foreign|p-projected|p-moved-worker) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
+      p-launch|p-zeus|p-zeus-worker|p-working|p-review|p-shared|p-stale|p-unrecorded|p-foreign|p-projected|p-moved-worker|p-parent-flat) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
       p-idle) printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}' ;;
       *) printf '%s\n' '{"error":{"code":"agent_not_found"}}' ;;
     esac
@@ -155,7 +161,7 @@ EOF
     '- zeus - Operating Studio delivery (host: zeus-host; root: /remote/firstmate; home: /remote/zeus-home; scope: Operating Studio delivery; projects: operating-studio; added 2026-09-22)' \
     '- other - Other delivery (host: zeus-host; root: /remote/firstmate; home: /remote/other-home; scope: Other delivery; projects: other; added 2026-09-22)' \
     > "$dir/home/data/secondmates.md"
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[]}' > "$dir/zeus-live.json"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[]}' > "$dir/zeus-live.json"
   write_linear_curl "$dir"
   printf '%s\n' "$dir"
 }
@@ -296,13 +302,13 @@ test_remote_inventory_is_fetched_live() {
   zeus="$dir/zeus-live.json"
   printf '%s\n' '{"cards":[{"id":"card-zeus","identifier":"OS-9","state":"In Progress"}]}' > "$cards"
   cat > "$zeus" <<'JSON'
-{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"zeus-worker","linear_card_id":"card-zeus","backend":"herdr","endpoint":"zeus:p9","herdr_session":"zeus","herdr_pane_id":"p9","endpoint_status":"alive"}]}
+{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[{"task_id":"zeus-worker","linear_card_id":"card-zeus","backend":"herdr","endpoint":"zeus:p9","herdr_session":"zeus","herdr_pane_id":"p9","endpoint_status":"alive"}]}
 JSON
   out=$(run_reconcile "$dir" "$cards") || fail "remote inventory reconciliation failed"
   printf '%s' "$out" | jq -e '
     .summary.workers == 1 and .findings[0].kind == "matched-live-endpoint"
   ' >/dev/null || fail "returned Zeus inventory was not reconciled: $out"
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[]}' > "$zeus"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[]}' > "$zeus"
   refreshed=$(run_reconcile "$dir" "$cards") || fail "refreshed remote inventory reconciliation failed"
   printf '%s' "$refreshed" | jq -e '
     .summary.workers == 0 and .findings[0].kind == "card-without-task-binding"
@@ -336,6 +342,8 @@ test_exact_live_worker_ownership_is_discovered() {
     || fail "moved owner live worker discovery failed"
   printf '%s' "$out" | jq -e '
     .summary.workers == 1
+    and .summary.needs_deep_check == 2
+    and .local_inventory.ownership_status == "needs-deep-check"
     and .local_inventory.children[0].task_id == "moved-worker"
     and .local_inventory.children[0].endpoint == "jarvis:p-moved-worker"
     and .local_inventory.children[0].endpoint_status == "alive"
@@ -361,18 +369,17 @@ test_exact_live_worker_ownership_is_discovered() {
   out=$(FM_TEST_HERDR_DISCOVERY=projection FM_TEST_PROJECTION_TOKEN="$token" \
     run_reconcile "$dir" "$cards") || fail "projected live worker discovery failed"
   printf '%s' "$out" | jq -e '
-    .summary.workers == 1
-    and .local_inventory.children[0].task_id == "projected"
-    and .local_inventory.children[0].endpoint == "jarvis:p-projected"
-    and .local_inventory.children[0].endpoint_status == "alive"
+    .summary.workers == 2
+    and ([.local_inventory.children[] | select(.task_id == "projected" and .endpoint == "jarvis:p-projected" and .endpoint_status == "alive")] | length) == 1
+    and ([.local_inventory.children[] | select(.task_id == "parent-flat" and .endpoint == "jarvis:p-parent-flat" and .endpoint_status == "alive")] | length) == 1
   ' >/dev/null || fail "exact projected worker binding was not counted: $out"
   write_meta "$dir/home" projected p-projected ''
   out=$(FM_TEST_HERDR_DISCOVERY=projection FM_TEST_PROJECTION_TOKEN="$token" \
     run_reconcile "$dir" "$cards") || fail "recorded projected worker reconciliation failed"
   printf '%s' "$out" | jq -e '
-    .summary.workers == 1
-    and (.local_inventory.children | length) == 1
-    and .local_inventory.children[0].endpoint_status == "alive"
+    .summary.workers == 2
+    and (.local_inventory.children | length) == 2
+    and all(.local_inventory.children[]; .endpoint_status == "alive")
   ' >/dev/null || fail "recorded projected worker was downgraded: $out"
 
   dir=$(make_case unavailable-worker-ownership)
@@ -416,6 +423,8 @@ EOF
     run_inventory "$dir" "$remote") \
     || fail "remote home inventory could not resolve its host-local owner record"
   printf '%s' "$out" | jq -e '
+    .ownership_status == "needs-deep-check"
+    and
     .children == [{task_id:"zeus-worker", linear_card_id:"", backend:"herdr",
       endpoint:"jarvis:p-zeus-worker", herdr_session:"jarvis",
       herdr_pane_id:"p-zeus-worker", endpoint_status:"alive"}]
@@ -442,8 +451,10 @@ EOF
     || fail "local registered Zeus inventory failed"
   printf '%s' "$out" | jq -e --arg home "$zeus_home" '
     .summary.workers == 1
+    and .zeus_inventory.ownership_status == "needs-deep-check"
     and .zeus_inventory.home == $home
     and .zeus_inventory.children[0].task_id == "zeus-worker"
+    and ([.findings[] | select(.kind == "needs-deep-check" and .home == $home)] | length) == 1
   ' >/dev/null || fail "local Zeus route was not preserved: $out"
   pass "local registered Zeus inventory route is accepted"
 }
@@ -488,31 +499,35 @@ test_live_remote_inventory_requires_complete_schema() {
   cards="$dir/cards.json"
   zeus="$dir/zeus-live.json"
   printf '%s\n' '{"cards":[]}' > "$cards"
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","endpoint_status":"alive"}]}' > "$zeus"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[]}' > "$zeus"
+  out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "Zeus inventory without ownership status was accepted"
+  case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "missing Zeus ownership status diagnostic drifted: $out" ;; esac
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[{"task_id":"worker","endpoint_status":"alive"}]}' > "$zeus"
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "incomplete Zeus child was accepted"
   case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "incomplete Zeus diagnostic drifted: $out" ;; esac
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p1","herdr_session":"zeus","herdr_pane_id":"p1","endpoint_status":"working"}]}' > "$zeus"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p1","herdr_session":"zeus","herdr_pane_id":"p1","endpoint_status":"working"}]}' > "$zeus"
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "unknown Zeus endpoint status was accepted"
   case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "unknown Zeus status diagnostic drifted: $out" ;; esac
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"","herdr_session":"","herdr_pane_id":"","endpoint_status":"alive"}]}' > "$zeus"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"","herdr_session":"","herdr_pane_id":"","endpoint_status":"alive"}]}' > "$zeus"
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "empty live Herdr identity was accepted"
   case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "empty Herdr identity diagnostic drifted: $out" ;; esac
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p2","herdr_session":"zeus","herdr_pane_id":"p1","endpoint_status":"alive"}]}' > "$zeus"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p2","herdr_session":"zeus","herdr_pane_id":"p1","endpoint_status":"alive"}]}' > "$zeus"
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "mismatched live Herdr identity was accepted"
   case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "mismatched Herdr identity diagnostic drifted: $out" ;; esac
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p1","herdr_session":"zeus","herdr_pane_id":"p1","endpoint_status":"not-applicable"}]}' > "$zeus"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p1","herdr_session":"zeus","herdr_pane_id":"p1","endpoint_status":"not-applicable"}]}' > "$zeus"
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "not-applicable Herdr status was accepted"
   case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "Herdr status relationship diagnostic drifted: $out" ;; esac
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"tmux","endpoint":"zeus:p1","herdr_session":"","herdr_pane_id":"","endpoint_status":"alive"}]}' > "$zeus"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[{"task_id":"worker","linear_card_id":"","backend":"tmux","endpoint":"zeus:p1","herdr_session":"","herdr_pane_id":"","endpoint_status":"alive"}]}' > "$zeus"
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "live non-Herdr status was accepted"
   case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "non-Herdr status relationship diagnostic drifted: $out" ;; esac
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/other-home","children":[]}' > "$zeus"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/other-home","ownership_status":"verified","children":[]}' > "$zeus"
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "another home was accepted as Zeus inventory"
   case "$out" in *'live Zeus inventory returned home'*) ;; *) fail "wrong Zeus owner diagnostic drifted: $out" ;; esac
@@ -571,13 +586,13 @@ test_duplicate_ownership_and_endpoint_identity() {
 
   rm -f "$dir/home/state"/*.meta
   write_meta "$dir/home" worker-a p-shared card-a
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"zeus-worker","linear_card_id":"card-b","backend":"herdr","endpoint":"jarvis:p-shared","herdr_session":"jarvis","herdr_pane_id":"p-shared","endpoint_status":"alive"}]}' > "$dir/zeus-live.json"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[{"task_id":"zeus-worker","linear_card_id":"card-b","backend":"herdr","endpoint":"jarvis:p-shared","herdr_session":"jarvis","herdr_pane_id":"p-shared","endpoint_status":"alive"}]}' > "$dir/zeus-live.json"
   cross_home=$(run_reconcile "$dir" "$cards") || fail "cross-home endpoint reconciliation failed"
   printf '%s' "$cross_home" | jq -e '
     .summary.workers == 2 and ([.findings[].kind] | all(. == "matched-live-endpoint"))
   ' >/dev/null || fail "server-local endpoints collided across homes: $cross_home"
 
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[]}' > "$dir/zeus-live.json"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[]}' > "$dir/zeus-live.json"
   write_nonherdr_meta "$dir/home" worker-b jarvis:p-shared card-b
   cross_backend=$(run_reconcile "$dir" "$cards") || fail "cross-backend endpoint reconciliation failed"
   printf '%s' "$cross_backend" | jq -e '
