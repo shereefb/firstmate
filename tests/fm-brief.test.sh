@@ -327,12 +327,15 @@ test_faster_paths_use_configured_authority_without_stacked_review() {
 # lane that deliberately holds a draft declares a wait instead. local-only opens
 # no PR, so it must not carry the requirement.
 test_pr_based_dod_requires_non_draft() {
-  local home mode id brief
+  local home mode id brief verb spec
   home="$TMP_ROOT/draft-dod-home"
   mkdir -p "$home/data"
-  for mode in no-mistakes direct-PR local-only; do
-    id="brief-draft-$mode"
-    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$mode" >/dev/null 2>&1
+  for spec in no-mistakes: direct-PR: local-only: no-mistakes:awaiting direct-PR:awaiting local-only:awaiting; do
+    mode=${spec%%:*}
+    verb=${spec#*:}
+    id="brief-draft-$mode${verb:+-$verb}"
+    FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
+      "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$mode" >/dev/null 2>&1
     brief="$home/data/$id/brief.md"
     assert_present "$brief" "$mode: brief was not scaffolded"
     if [ "$mode" = local-only ]; then
@@ -345,8 +348,8 @@ test_pr_based_dod_requires_non_draft() {
     # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
     assert_grep 'mark it ready with `gh-axi pr ready`' "$brief" \
       "$mode: a draft must be marked ready before done"
-    assert_grep "If you deliberately keep the PR a draft, append \`paused" "$brief" \
-      "$mode: a deliberate draft must declare a wait instead of done"
+    assert_grep "append \`${verb:-paused} [at=<epoch>]: {why the draft is held}\`" "$brief" \
+      "$mode: a deliberate draft must declare a wait in the configured pause verb"
   done
   pass "fm-brief.sh: PR-based done requires a non-draft PR; a deliberate draft declares a wait"
 }
@@ -868,9 +871,8 @@ SIGNALS
     # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
     assert_grep 'Use `awaiting: {why}`' "$brief" \
       "$kind brief did not instruct the configured pause status"
-    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-    assert_no_grep '`paused: {why}`' "$brief" \
-      "$kind brief still instructs the default paused status"
+    ! grep -qw paused "$brief" \
+      || fail "$kind brief still names the default pause verb where the override must reach"
     assert_grep 'a blocker or wait clears' "$brief" \
       "$kind brief did not require durable resolution when a blocker clears"
     assert_grep 'even when the answer is what started that work' "$brief" \
@@ -896,6 +898,58 @@ test_ship_and_scout_teach_validation_round_pause() {
       "$kind brief did not teach workers to declare their validation-round wait"
   done
   pass "fm-brief.sh: ship and scout scaffolds teach validation-round pauses"
+}
+
+# fm-brief.sh emits the brief as blank-line-delimited paragraphs under its own
+# `# ` headings - structure the generator owns, not prose. Prints the paragraph
+# containing <anchor>.
+brief_paragraph() {  # <anchor> <brief>
+  awk -v a="$1" 'BEGIN { RS = "" } index($0, a)' "$2"
+}
+
+# A worker that settles into a long poll must be told to declare the wait, and
+# the instruction must sit in the block that describes that wait - the
+# no-mistakes polling paragraph, the scout rules block - not in a distant
+# section a worker reads once at launch. Shapes whose worker never drives a
+# long-running run must not carry it at all. Only the status-line template is
+# asserted, so rewording the prose around it breaks nothing.
+test_wait_declaration_instruction_placement() {
+  local home kind id brief verb rc tpl anchor
+  local -a args
+  home="$TMP_ROOT/wait-declaration-home"
+  mkdir -p "$home/data"
+
+  for verb in "" awaiting; do
+    for kind in ship:no-mistakes ship:direct-PR ship:local-only scout secondmate; do
+      id="wait-declaration-${kind//:/-}${verb:+-$verb}"
+      case "$kind" in
+        ship:*) args=("$id" firstmate --mode "${kind#ship:}") ;;
+        scout) args=("$id" firstmate --scout) ;;
+        secondmate) args=("$id" --secondmate --no-projects) ;;
+      esac
+      FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
+        "$ROOT/bin/fm-brief.sh" "${args[@]}" >/dev/null 2>&1
+      rc=$?
+      expect_code 0 "$rc" "$kind (pause verb ${verb:-default}) must scaffold a brief"
+      brief="$home/data/$id/brief.md"
+      assert_present "$brief" \
+        "$kind (pause verb ${verb:-default}) wrote no brief to $brief"
+
+      tpl="\`${verb:-paused} [at=<epoch>]: {what you are waiting for}\`"
+      case "$kind" in
+        ship:no-mistakes) anchor='background the drive call and poll' ;;
+        scout) anchor='# Rules' ;;
+        *)
+          assert_no_grep "$tpl" "$brief" \
+            "$kind brief declares a polling wait its worker never performs"
+          continue
+          ;;
+      esac
+      brief_paragraph "$anchor" "$brief" | grep -qF -- "$tpl" || fail \
+        "$kind brief does not declare the wait inside the block anchored at \"$anchor\""
+    done
+  done
+  pass "fm-brief.sh: a polling worker is told to declare its wait, in the block that waits"
 }
 
 test_scout_and_secondmate_load_decision_hold_policy() {
@@ -1083,6 +1137,7 @@ test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable
 test_pause_verb_override_renders_all_brief_scaffolds
 test_ship_and_scout_teach_validation_round_pause
+test_wait_declaration_instruction_placement
 test_scout_and_secondmate_load_decision_hold_policy
 test_scout_and_secondmate_scaffold
 test_scout_lavish_line_follows_presentation_floor
