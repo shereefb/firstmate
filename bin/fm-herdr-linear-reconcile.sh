@@ -181,7 +181,16 @@ jq -e '
     and (.herdr_pane_id | type) == "string"
     and (.endpoint_status as $status
       | ["alive", "dead", "missing", "ambiguous", "unreadable", "unverified", "not-applicable"]
-      | index($status) != null))
+      | index($status) != null)
+    and (if .backend == "herdr" then
+      (.endpoint | length) > 0
+      and (.herdr_session | length) > 0
+      and (.herdr_pane_id | length) > 0
+      and .endpoint == (.herdr_session + ":" + .herdr_pane_id)
+      and .endpoint_status != "not-applicable"
+    else
+      .endpoint_status == "not-applicable"
+    end))
 ' "$TMP/zeus.json" >/dev/null 2>&1 || {
   echo 'fm-herdr-linear-reconcile: Zeus inventory is invalid' >&2
   exit 1
@@ -217,7 +226,8 @@ command -v curl >/dev/null 2>&1 || {
       --arg after "$cursor" \
       '{query:"query OperatingStudioCards($team: ID!, $project: ID!, $after: String) { issues(first: 250, after: $after, filter: { team: { id: { eq: $team } }, project: { id: { eq: $project } }, state: { name: { in: [\"In Progress\", \"In Review\"] } } }) { nodes { id identifier state { name } } pageInfo { hasNextPage endCursor } } }",variables:{team:$team,project:$project,after:(if $after == "" then null else $after end)}}')
     if ! curl --fail --silent --show-error --max-time 15 \
-      -H 'Content-Type: application/json' -H "Authorization: $LINEAR_API_KEY" \
+      -H 'Content-Type: application/json' -H @/dev/fd/3 \
+      3< <(printf 'Authorization: %s\n' "$LINEAR_API_KEY") \
       --data "$payload" https://api.linear.app/graphql > "$TMP/linear-api.json"; then
       echo 'fm-herdr-linear-reconcile: Linear API request failed' >&2
       exit 1
@@ -253,15 +263,17 @@ command -v curl >/dev/null 2>&1 || {
   }
 
 REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.json" --slurpfile cards "$TMP/cards.json" '
-  ($local[0].children + $zeus[0].children) as $workers
+  ([ $local[0].children[] | . + {home:$local[0].home} ]
+   + [ $zeus[0].children[] | . + {home:$zeus[0].home} ]) as $records
+  | [ $records[] | select(.backend == "herdr" and .endpoint_status == "alive") ] as $workers
   | $cards[0] as $cards
-  | [ $workers[] | select(.endpoint != "")
-      | {endpoint, task_id} ]
-    | group_by(.endpoint)
-    | map(select(length > 1) | {endpoint:.[0].endpoint, task_ids:map(.task_id)}) as $duplicate_endpoints
+  | [ $records[] | select(.endpoint != "")
+      | {key:[.home, .backend, .endpoint]} ]
+    | group_by(.key)
+    | map(select(length > 1) | .[0].key) as $duplicate_endpoint_keys
   | [ $cards[] | .id ] | group_by(.) | map(select(length > 1) | .[0]) as $duplicate_cards
   | [ $cards[] as $card
-      | ([ $workers[] | select(.linear_card_id == $card.id) ]) as $bound
+      | ([ $records[] | select(.linear_card_id == $card.id) ]) as $bound
       | if ($duplicate_cards | index($card.id)) then
           {kind:"duplicate-card", card_id:$card.id, identifier:$card.identifier,
            detail:"Linear returned the same card identity more than once"}
@@ -272,7 +284,7 @@ REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.j
           {kind:"duplicate-ownership", card_id:$card.id, identifier:$card.identifier,
            task_ids:($bound | map(.task_id)), detail:"multiple tasks claim this card"}
         else $bound[0] as $worker
-          | if ($duplicate_endpoints | map(.task_ids | index($worker.task_id)) | any) then
+          | if any($duplicate_endpoint_keys[]; . == [$worker.home, $worker.backend, $worker.endpoint]) then
               {kind:"duplicate-endpoint", card_id:$card.id, identifier:$card.identifier,
                task_id:$worker.task_id, endpoint:$worker.endpoint,
                detail:"the recorded endpoint belongs to multiple tasks"}

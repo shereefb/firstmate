@@ -79,6 +79,11 @@ write_linear_curl() { # <case-dir>
 #!/usr/bin/env bash
 cards_file=${FM_TEST_LINEAR_CARDS_FILE:?}
 payload=
+authorization=$(cat /dev/fd/3) || exit 22
+[ "$authorization" = 'Authorization: secret' ] || exit 22
+for arg in "$@"; do
+  case "$arg" in *secret*) exit 22 ;; esac
+done
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --data ]; then
     shift
@@ -89,7 +94,6 @@ done
 printf '%s' "$payload" | jq -e '
   .variables.team == "team-os"
   and .variables.project == "project-os"
-  and (.query | contains("project: { id: { eq: $project } }"))
 ' >/dev/null || exit 22
 after=$(printf '%s' "$payload" | jq -r '.variables.after // ""')
 if [ "${FM_TEST_LINEAR_PAGINATED:-0}" = 1 ]; then
@@ -112,6 +116,15 @@ write_meta() { # <home> <task> <pane> <card-id>
     printf 'window=jarvis:%s\n' "$pane"
     printf 'herdr_session=jarvis\n'
     printf 'herdr_pane_id=%s\n' "$pane"
+    [ -z "$card" ] || printf 'linear_card_id=%s\n' "$card"
+  } > "$home/state/$task.meta"
+}
+
+write_nonherdr_meta() { # <home> <task> <endpoint> <card-id>
+  local home=$1 task=$2 endpoint=$3 card=$4
+  {
+    printf 'backend=tmux\n'
+    printf 'window=%s\n' "$endpoint"
     [ -z "$card" ] || printf 'linear_card_id=%s\n' "$card"
   } > "$home/state/$task.meta"
 }
@@ -189,6 +202,7 @@ test_process_liveness_outranks_recorded_agent_status() {
     ([.findings[] | select(.task_id == "live-idle")][0].kind == "matched-live-endpoint")
     and ([.findings[] | select(.task_id == "stale-working")][0].kind == "needs-deep-check")
     and ([.local_inventory.children[] | select(.task_id == "stale-working")][0].endpoint_status == "dead")
+    and .summary.workers == 1
   ' >/dev/null || fail "raw Herdr status overrode process-backed liveness: $out"
   pass "process-backed liveness accepts live idle agents and rejects stale working registrations"
 }
@@ -224,6 +238,22 @@ test_live_remote_inventory_requires_complete_schema() {
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "unknown Zeus endpoint status was accepted"
   case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "unknown Zeus status diagnostic drifted: $out" ;; esac
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"","herdr_session":"","herdr_pane_id":"","endpoint_status":"alive"}]}' > "$zeus"
+  out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "empty live Herdr identity was accepted"
+  case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "empty Herdr identity diagnostic drifted: $out" ;; esac
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p2","herdr_session":"zeus","herdr_pane_id":"p1","endpoint_status":"alive"}]}' > "$zeus"
+  out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "mismatched live Herdr identity was accepted"
+  case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "mismatched Herdr identity diagnostic drifted: $out" ;; esac
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"herdr","endpoint":"zeus:p1","herdr_session":"zeus","herdr_pane_id":"p1","endpoint_status":"not-applicable"}]}' > "$zeus"
+  out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "not-applicable Herdr status was accepted"
+  case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "Herdr status relationship diagnostic drifted: $out" ;; esac
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"worker","linear_card_id":"","backend":"tmux","endpoint":"zeus:p1","herdr_session":"","herdr_pane_id":"","endpoint_status":"alive"}]}' > "$zeus"
+  out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "live non-Herdr status was accepted"
+  case "$out" in *'Zeus inventory is invalid'*) ;; *) fail "non-Herdr status relationship diagnostic drifted: $out" ;; esac
   printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/other-home","children":[]}' > "$zeus"
   out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "another home was accepted as Zeus inventory"
@@ -262,8 +292,8 @@ test_linear_api_requires_project_and_reads_all_pages() {
   pass "Linear API requires project identity and consumes every page"
 }
 
-test_duplicate_ownership_and_endpoint_are_not_coverage() {
-  local dir cards ownership endpoint
+test_duplicate_ownership_and_endpoint_identity() {
+  local dir cards ownership endpoint cross_home cross_backend
   dir=$(make_case duplicates)
   write_meta "$dir/home" worker-a p-working card-a
   write_meta "$dir/home" worker-b p-idle card-a
@@ -280,7 +310,24 @@ test_duplicate_ownership_and_endpoint_are_not_coverage() {
   endpoint=$(run_reconcile "$dir" "$cards") || fail "duplicate endpoint reconciliation failed"
   printf '%s' "$endpoint" | jq -e '[.findings[].kind] | all(. == "duplicate-endpoint")' >/dev/null \
     || fail "duplicate endpoints were accepted: $endpoint"
-  pass "duplicate card ownership and endpoints do not count as coverage"
+
+  rm -f "$dir/home/state"/*.meta
+  write_meta "$dir/home" worker-a p-shared card-a
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[{"task_id":"zeus-worker","linear_card_id":"card-b","backend":"herdr","endpoint":"jarvis:p-shared","herdr_session":"jarvis","herdr_pane_id":"p-shared","endpoint_status":"alive"}]}' > "$dir/zeus-live.json"
+  cross_home=$(run_reconcile "$dir" "$cards") || fail "cross-home endpoint reconciliation failed"
+  printf '%s' "$cross_home" | jq -e '
+    .summary.workers == 2 and ([.findings[].kind] | all(. == "matched-live-endpoint"))
+  ' >/dev/null || fail "server-local endpoints collided across homes: $cross_home"
+
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","children":[]}' > "$dir/zeus-live.json"
+  write_nonherdr_meta "$dir/home" worker-b jarvis:p-shared card-b
+  cross_backend=$(run_reconcile "$dir" "$cards") || fail "cross-backend endpoint reconciliation failed"
+  printf '%s' "$cross_backend" | jq -e '
+    .summary.workers == 1
+    and ([.findings[] | select(.task_id == "worker-a")][0].kind == "matched-live-endpoint")
+    and ([.findings[] | select(.task_id == "worker-b")][0].kind == "needs-deep-check")
+  ' >/dev/null || fail "backend-local endpoints collided: $cross_backend"
+  pass "duplicate ownership and scoped endpoint identity are enforced"
 }
 
 test_unrelated_worker_and_missing_endpoint() {
@@ -290,13 +337,17 @@ test_unrelated_worker_and_missing_endpoint() {
   write_meta "$dir/home" orphan p-idle ''
   write_meta "$dir/home" missing p-missing card-missing
   write_meta "$dir/home" review p-review card-review
+  write_meta "$dir/home" stale p-stale ''
+  write_nonherdr_meta "$dir/home" legacy jarvis:p-legacy ''
   cards="$dir/cards.json"
   printf '%s\n' '{"cards":[{"id":"card-working","identifier":"OS-1","state":"In Progress"},{"id":"card-missing","identifier":"OS-2","state":"In Progress"},{"id":"card-review","identifier":"OS-3","state":"In Review"}]}' > "$cards"
   out=$(run_reconcile "$dir" "$cards") || fail "discrepancy reconciliation failed"
   printf '%s' "$out" | jq -e '
     ([.findings[].kind] | sort) == ["matched-live-endpoint", "matched-live-endpoint", "missing-endpoint", "worker-without-applicable-card"]
+    and .summary.workers == 3
+    and ([.findings[] | select(.task_id == "stale" or .task_id == "legacy")] | length) == 0
   ' >/dev/null || fail "unrelated or missing endpoint classification drifted: $out"
-  pass "unrelated workers and missing endpoints remain visible"
+  pass "only running workers contribute to counts and unbound findings"
 }
 
 test_non_applicable_columns_do_not_cover_workers() {
@@ -342,7 +393,7 @@ test_required_inputs_fail_clearly() {
 test_equal_count_wrong_identity
 test_remote_inventory_is_fetched_live
 test_local_registered_inventory_route_is_accepted
-test_duplicate_ownership_and_endpoint_are_not_coverage
+test_duplicate_ownership_and_endpoint_identity
 test_unrelated_worker_and_missing_endpoint
 test_non_applicable_columns_do_not_cover_workers
 test_process_liveness_outranks_recorded_agent_status
