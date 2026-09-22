@@ -871,9 +871,8 @@ SIGNALS
     # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
     assert_grep 'Use `awaiting: {why}`' "$brief" \
       "$kind brief did not instruct the configured pause status"
-    # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
-    assert_no_grep '`paused: {why}`' "$brief" \
-      "$kind brief still instructs the default paused status"
+    ! grep -qw paused "$brief" \
+      || fail "$kind brief still names the default pause verb where the override must reach"
     assert_grep 'a blocker or wait clears' "$brief" \
       "$kind brief did not require durable resolution when a blocker clears"
     assert_grep 'even when the answer is what started that work' "$brief" \
@@ -907,8 +906,12 @@ test_wait_declaration_instruction_placement() {
   home="$TMP_ROOT/wait-declaration-home"
   mkdir -p "$home/data"
 
+  # The wait declaration belongs at each point of use: the no-mistakes
+  # Definition of done, where the worker backgrounds the drive call and polls,
+  # and the scout rules block, where a scout settles into a long run. The
+  # secondmate charter supervises rather than polls and carries none.
   for verb in "" awaiting; do
-    for kind in ship:no-mistakes ship:direct-PR ship:local-only scout secondmate; do
+    for kind in ship:no-mistakes scout secondmate; do
       id="wait-declaration-${kind//:/-}${verb:+-$verb}"
       case "$kind" in
         ship:*) args=("$id" firstmate --mode "${kind#ship:}") ;;
@@ -923,10 +926,6 @@ test_wait_declaration_instruction_placement() {
       assert_present "$brief" \
         "$kind scaffold (pause verb ${verb:-default}) wrote no brief to $brief"
 
-      # The wait declaration is ONE shared instruction in rule 4's status
-      # protocol: every ship and scout brief renders exactly one stamped
-      # template, and the secondmate charter renders none. A per-mode copy
-      # returning to a Definition of done raises the count and fails here.
       declarations=$(grep -c -F -- '[at=<epoch>]: {what you are waiting for}' "$brief")
       if [ "$kind" = secondmate ]; then
         [ "$declarations" = 0 ] || fail \
@@ -934,15 +933,13 @@ test_wait_declaration_instruction_placement() {
         continue
       fi
       [ "$declarations" = 1 ] || fail \
-        "$kind brief renders $declarations wait-declaration templates; rule 4 must carry exactly one"
+        "$kind brief renders $declarations wait-declaration templates; its point of use must carry one"
       # shellcheck disable=SC2016 # Literal backticks and braces must remain unexpanded.
       assert_grep "\`${verb:-paused} [at=<epoch>]: {what you are waiting for}\`" \
         "$brief" "$kind brief did not render the configured pause verb and stamp in its wait declaration"
-      assert_grep 'until <YYYY-MM-DDTHH:MMZ>' "$brief" \
-        "$kind brief did not offer the until bound that ends a declared wait's recheck window"
     done
   done
-  pass "fm-brief.sh: every ship and scout brief carries exactly one wait-declaration instruction"
+  pass "fm-brief.sh: the wait declaration sits at each point of use in the configured verb"
 }
 
 test_scout_and_secondmate_load_decision_hold_policy() {

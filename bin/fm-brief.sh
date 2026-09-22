@@ -111,11 +111,6 @@ esac
 . "$SCRIPT_DIR/fm-dod-lib.sh"
 PAUSED_VERB=$(fm_classify_paused_verb)
 CREWMATE_PAUSE_WAIT_EXAMPLES='an upstream release, a rate-limit reset, a scheduled window, or your own validation round'
-CREWMATE_WAIT_DECLARATION="   When you settle into polling a validation round or any run you intend to sit and wait on,
-   append \`$PAUSED_VERB [at=<epoch>]: {what you are waiting for}\` before you start waiting - once for the
-   wait, not once per poll - and append your next ordinary status line when it ends; rule 6's \`resolved\`
-   line still applies when the wait was a blocker you opened. When you know when it clears, name it in the
-   same line with \`until <YYYY-MM-DDTHH:MMZ>\` (UTC) and firstmate rechecks then rather than on the long cadence."
 
 resolve_directory_input() {
   local name=$1 path=$2 resolved
@@ -433,7 +428,7 @@ The report is the only thing that survives, so anything worth keeping must be in
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
    Substitute \`<epoch>\` with the current Unix time in seconds - run \`date +%s\` and write the number it printed; a stamp that is not plain digits records no time at all.
    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
-   would act on and the needs-decision/blocked/paused/done/failed states. No step-by-step
+   would act on and the needs-decision/blocked/$PAUSED_VERB/done/failed states. No step-by-step
    FYI progress lines; firstmate reads your pane for that.
    Whenever you mention a PR anywhere - a status line, your terminal, a summary - write its full
    https:// URL exactly as the forge printed it, never a bare number such as "PR 108"; firstmate
@@ -441,8 +436,11 @@ The report is the only thing that survives, so anything worth keeping must be in
    Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
    known external wait you expect to clear on its own ($CREWMATE_PAUSE_WAIT_EXAMPLES):
    firstmate then leaves your idle pane alone and rechecks it on a long cadence instead of
-   treating it as a possible wedge.
-$CREWMATE_WAIT_DECLARATION
+   treating it as a possible wedge. When you know when the wait clears, say so in the line with
+   \`until <YYYY-MM-DDTHH:MMZ>\` (UTC) and firstmate rechecks at that time instead.
+   When you settle into polling a long run you intend to sit and wait on, append one
+   \`$PAUSED_VERB [at=<epoch>]: {what you are waiting for}\` line before you start, once for the wait and
+   not once per poll: a silent worker and a dead worker look identical from outside.
    Use \`blocked:\` when you are stuck and need help.
 5. If you hit the same obstacle twice, append \`blocked [at=<epoch>]: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
@@ -523,7 +521,7 @@ $RULE1
    Substitute \`<epoch>\` with the current Unix time in seconds - run \`date +%s\` and write the number it printed; a stamp that is not plain digits records no time at all.
    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
    would act on (setup done, bug reproduced, fix implemented, validation passed) and the
-   needs-decision/blocked/paused/done/failed states. No step-by-step FYI progress lines;
+   needs-decision/blocked/$PAUSED_VERB/done/failed states. No step-by-step FYI progress lines;
    firstmate reads your pane for that.
    Whenever you mention a PR anywhere - a status line, your terminal, a summary - write its full
    https:// URL exactly as the forge printed it, never a bare number such as "PR 108"; firstmate
@@ -533,9 +531,7 @@ $RULE1
    Use \`$PAUSED_VERB: {why}\` - distinct from \`blocked:\` - ONLY when you are deliberately idling on a
    known external wait you expect to clear on its own ($CREWMATE_PAUSE_WAIT_EXAMPLES):
    firstmate then leaves your idle pane alone and rechecks it on a long
-   cadence instead of treating it as a possible wedge.
-$CREWMATE_WAIT_DECLARATION
-   Use \`blocked:\` when you are stuck and need help.
+   cadence instead of treating it as a possible wedge. Use \`blocked:\` when you are stuck and need help.
 5. If you hit the same obstacle twice, append \`blocked [at=<epoch>]: {why}\` and stop; firstmate will help.
 6. If a decision belongs above the implementation worker (product choices, destructive actions),
    append \`needs-decision [at=<epoch>]: {summary of options}\` and stop. Firstmate will reply with the decision.

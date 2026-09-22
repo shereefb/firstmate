@@ -5,6 +5,9 @@
 # receives. Both paths must hand the worker the same contract: a promoted
 # no-mistakes worker that never received the ask-user escalation rule or the
 # `--yes` ban is the exact delivery hole this single owner exists to close.
+# The declared-external-wait verb it renders comes from bin/fm-classify-lib.sh,
+# this file's one dependency: _fm_dod_require_classify loads it on demand so the
+# verb has a single definition and no caller has to source it in the right order.
 # fm_dod_block <no-mistakes|direct-PR|local-only> <task-id> prints the block on
 # stdout with no trailing blank line. The caller validates the mode; an unknown
 # mode is refused rather than silently rendered as the pipeline contract.
@@ -42,6 +45,14 @@
 # conflicting role is superseded rather than duplicated.
 # fm_ship_rule_one owns the mode-specific first ship safety rule shared by an
 # ordinary ship brief and the durable contract written during scout promotion.
+
+_FM_DOD_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_fm_dod_require_classify() {
+  command -v fm_classify_paused_verb >/dev/null 2>&1 && return 0
+  # shellcheck source=bin/fm-classify-lib.sh
+  . "$_FM_DOD_LIB_DIR/fm-classify-lib.sh"
+}
 
 fm_brief_worker_role() {  # <state-dir> <task-id>
   local state=$1 task_id=$2
@@ -246,6 +257,7 @@ EOF
 
 fm_dod_block() {  # <mode> <task-id>
   local mode=$1 id=$2 paused_verb
+  _fm_dod_require_classify
   paused_verb=$(fm_classify_paused_verb)
   case "$mode" in
     direct-PR)
@@ -296,6 +308,9 @@ Do not hand-edit, commit, or fix findings yourself while a run is active - the p
 One drive call blocks until the next gate or outcome, which routinely outlives what your harness lets a single command run: Claude Code kills a command at ten minutes maximum, while one fix round is capped around thirty minutes and up to three rounds chain.
 So background the drive call and poll \`no-mistakes axi status\` from a separate call instead of sitting in one blocking hold your harness will kill.
 Where a harness's own command limit is not established, assume it bounds commands and use that same background-and-poll shape.
+The moment you settle into polling, append one \`$paused_verb [at=<epoch>]: {what you are waiting for}\` line, once for the wait and not once per poll, and append your next real line (\`working:\`, \`needs-decision:\`, \`done:\`, or \`failed:\`) when it ends.
+From outside, a silent worker and a dead worker look identical; a declared wait is rechecked on a long cadence, while undeclared silence is escalated as a possible wedge.
+Apply the same rule to any other run you intend to sit and wait on.
 A killed or timed-out call is never evidence the daemon died: the daemon accepts your response immediately and runs the round in the background, so the call was only ever waiting for a read while the run kept working.
 Reattach and keep going rather than reporting the pipeline blocked; rule 7 owns the checks that decide when a pipeline block is real.
 
