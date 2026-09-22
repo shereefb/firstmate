@@ -222,13 +222,18 @@ Workspace and tab ids support verification and cleanup but are not inferred from
 `bin/fm-herdr-linear-reconcile.sh` provides a read-only first pass for Operating Studio's In Progress and In Review Linear cards.
 A task records its immutable Linear issue id as `linear_card_id=` through `fm-spawn.sh --linear-card-id <id>`.
 The command joins that id to the card id and joins the task to its recorded Herdr session and pane ids, never to titles, pane order, or totals.
-The primary runs `--linear-api` with `LINEAR_API_KEY`, `FM_LINEAR_OPERATING_STUDIO_TEAM_ID`, and `FM_LINEAR_OPERATING_STUDIO_PROJECT_ID` set locally.
+The comparison command runs `--linear-api` with `LINEAR_API_KEY`, `FM_LINEAR_OPERATING_STUDIO_TEAM_ID`, and `FM_LINEAR_OPERATING_STUDIO_PROJECT_ID` set locally.
 Comparison resolves the `zeus` secondmate through the primary home's `data/secondmates.md` and obtains a fresh inventory from the registered local home or through its registered `fm-on.sh` route.
 The primary rejects an unavailable route, invalid returned inventory, or returned home that differs from the registered home.
 API mode refuses to run without both identities, filters by both, and reads every result page.
 The command always emits one JSON object that names exact identity, verified-live-worker count, duplicate, and home-scoped endpoint discrepancies as well as `needs-deep-check` results.
-No scheduler is installed: a heartbeat or check owner may consume this report only after it owns Linear credentials and the registered Zeus route.
+The persistent `buildboard` secondmate is the sole automatic owner.
+Put its read-only Linear credential and the two Operating Studio identities in that home's gitignored `.env`, then run `bin/fm-herdr-linear-check.sh arm` from that home.
+The command idempotently installs one hash-bound custom check on the existing watcher, gates reconciliation to one run every 15 minutes, stays silent when every identity and count matches, and emits one actionable line when deeper inspection is needed or reconciliation fails.
+Run `bin/fm-herdr-linear-check.sh retire` to remove the shim, trust binding, and cadence record idempotently.
+This uses no cron, background loop, or second coordinator, and the credential is never written into the tracked shim or repository.
 `tests/fm-herdr-linear-reconcile.test.sh` covers the portable behavior.
+`tests/fm-herdr-linear-check.test.sh` covers automatic ownership and lifecycle behavior.
 
 ## Current transport behavior
 
