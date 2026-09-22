@@ -319,7 +319,7 @@ discover_live_workers() { # <rows>
 
 local_inventory() {
   local rows="$TMP/local.rows" live_rows="$TMP/local-live.rows"
-  local meta id kind backend endpoint card session pane status value
+  local meta id kind backend endpoint card session pane status value index output pid status_count job_index probe_rc
   [ -d "$STATE" ] && [ ! -L "$STATE" ] && [ -r "$STATE" ] && [ -x "$STATE" ] || {
     echo "fm-herdr-linear-reconcile: inventory state directory is unavailable: $STATE" >&2
     return 1
@@ -377,13 +377,33 @@ local_inventory() {
   jq -r '.[] | select(.backend == "herdr" and .endpoint_status == "pending") | .endpoint' \
     "$TMP/local-union.json" | sort -u > "$TMP/local-endpoints"
   : > "$TMP/local-status.rows"
+  : > "$TMP/local-status.jobs"
+  index=0
   while IFS= read -r endpoint; do
     [ -n "$endpoint" ] || continue
-    status=$(fm_backend_agent_state herdr "$endpoint") || status=unreadable
-    case "$status" in alive|dead|missing|ambiguous|unreadable|unverified) : ;; *) status=unreadable ;; esac
-    safe_field "$endpoint" && safe_field "$status" || return 1
-    printf '%s\t%s\n' "$endpoint" "$status" >> "$TMP/local-status.rows"
+    index=$((index + 1))
+    output="$TMP/local-status.$index"
+    (
+      status=$(fm_backend_agent_state herdr "$endpoint") || status=unreadable
+      case "$status" in alive|dead|missing|ambiguous|unreadable|unverified) : ;; *) status=unreadable ;; esac
+      safe_field "$endpoint" && safe_field "$status" || exit 1
+      printf '%s\t%s\n' "$endpoint" "$status"
+    ) > "$output" &
+    printf '%s\t%s\n' "$!" "$index" >> "$TMP/local-status.jobs"
   done < "$TMP/local-endpoints"
+  status_count=$index
+  probe_rc=0
+  while IFS=$'\t' read -r pid job_index; do
+    [ -n "$pid" ] || continue
+    wait "$pid" || probe_rc=1
+  done < "$TMP/local-status.jobs"
+  [ "$probe_rc" -eq 0 ] || return 1
+  index=1
+  while [ "$index" -le "$status_count" ]; do
+    output="$TMP/local-status.$index"
+    cat "$output" >> "$TMP/local-status.rows" || return 1
+    index=$((index + 1))
+  done
   jq -Rn '[inputs | split("\t") | select(length == 2) | {endpoint:.[0], status:.[1]}]' \
     < "$TMP/local-status.rows" > "$TMP/local-status.json"
   jq --slurpfile statuses "$TMP/local-status.json" '

@@ -115,6 +115,19 @@ case "${1:-} ${2:-}" in
     ;;
   'agent get')
     case "${3:-}" in
+      p-parallel-a|p-parallel-b)
+        pane=${3#p-parallel-}
+        other=b
+        [ "$pane" = a ] || other=a
+        : > "$FM_TEST_PARALLEL_LIVENESS_DIR/$pane"
+        count=0
+        while [ ! -e "$FM_TEST_PARALLEL_LIVENESS_DIR/$other" ] && [ "$count" -lt 50 ]; do
+          sleep 0.1
+          count=$((count + 1))
+        done
+        [ -e "$FM_TEST_PARALLEL_LIVENESS_DIR/$other" ] || exit 99
+        printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}'
+        ;;
       p-race)
         count=$(cat "$FM_TEST_LIVENESS_COUNT" 2>/dev/null || echo 0)
         printf '%s\n' "$((count + 1))" > "$FM_TEST_LIVENESS_COUNT"
@@ -558,6 +571,24 @@ test_inventory_uses_one_post_discovery_liveness_sample() {
   pass "inventory samples each Herdr endpoint once after discovery"
 }
 
+test_inventory_samples_worker_liveness_concurrently() {
+  local dir cards barrier out
+  dir=$(make_case parallel-liveness)
+  cards="$dir/cards.json"
+  barrier="$dir/liveness-barrier"
+  mkdir -p "$barrier"
+  write_meta "$dir/home" parallel-a p-parallel-a card-a
+  write_meta "$dir/home" parallel-b p-parallel-b card-b
+  printf '%s\n' '{"cards":[{"id":"card-a","identifier":"OS-A","state":"In Progress"},{"id":"card-b","identifier":"OS-B","state":"In Progress"}]}' > "$cards"
+  out=$(FM_TEST_PARALLEL_LIVENESS_DIR="$barrier" run_reconcile "$dir" "$cards") \
+    || fail "concurrent worker liveness reconciliation failed"
+  printf '%s' "$out" | jq -e '
+    .summary == {cards:2, workers:2, matched:2, needs_deep_check:0}
+    and all(.local_inventory.children[]; .endpoint_status == "alive")
+  ' >/dev/null || fail "worker liveness probes ran serially: $out"
+  pass "inventory samples independent worker liveness concurrently"
+}
+
 test_empty_card_identities_are_rejected() {
   local dir cards out rc
   dir=$(make_case empty-card-identity)
@@ -808,6 +839,7 @@ test_unbound_unresolved_worker_requires_deep_check
 test_non_applicable_columns_do_not_cover_workers
 test_process_liveness_outranks_recorded_agent_status
 test_inventory_uses_one_post_discovery_liveness_sample
+test_inventory_samples_worker_liveness_concurrently
 test_empty_card_identities_are_rejected
 test_live_remote_inventory_requires_complete_schema
 test_linear_api_requires_project_and_reads_all_pages
