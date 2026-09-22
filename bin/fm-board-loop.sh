@@ -6,9 +6,8 @@
 #   fm-board-loop.sh [scan] [--cards <file>] [--remote-inventory <file>]
 #   fm-board-loop.sh inventory
 #   fm-board-loop.sh recover [--cards <file>] [--remote-inventory <file>]
-#   fm-board-loop.sh enforce [--cards <file>] [--remote-inventory <file>]
 #   fm-board-loop.sh pause [--reason <text>]
-#   fm-board-loop.sh resume
+#   fm-board-loop.sh resume --card <Linear-id-or-identifier>
 #
 # The command is the single owner of the board-loop classification and of the
 # durable deployment ledger it reads and writes:
@@ -21,14 +20,10 @@
 #     owning worker through bin/fm-send.sh's durable inbox, or reports that the
 #     cause must be escalated. It never issues a lifecycle action
 #     (interrupt/exit/relaunch), never merges, and never mutates Linear. It
-#     fails CLOSED while a durable stop posture is active: the
-#     `state/.board-loop-pause` marker written by `pause` and removed by
-#     `resume`, the FM_BOARD_LOOP_PAUSE=1 process override, or a configured
-#     stop-status file (FM_BOARD_LOOP_STOP_STATUS) whose newest stop-key line is
-#     paused/blocked. A live endpoint is never evidence that recovery is safe.
+#     fails CLOSED by default. `resume --card` grants recovery to one card, and
+#     `pause` revokes every grant. A live endpoint or status-log history is
+#     never evidence that recovery is safe.
 #     `scan` stays read-only and may run under the stop posture.
-#   * `enforce` directly advances only evidence-complete Linear transitions. It
-#     never steers a worker, reviews a PR, or merges a PR.
 #
 # Identity is authoritative and never inferred: a lane joins a card only by the
 # immutable Linear issue id recorded as `linear_card_id=` in task metadata, and
@@ -60,11 +55,8 @@
 #   FM_BOARD_LOOP_SEND_CMD            bounded recovery steer command
 #   FM_BOARD_LOOP_STALL_SECS          stall window for an unmoved disposition, default 1800
 #   FM_BOARD_LOOP_PAUSE               set to 1 to force recovery closed
-#   FM_BOARD_LOOP_STOP_STATUS         status file whose stop-key line gates recovery
-#   FM_BOARD_LOOP_STOP_KEYS           space-separated stop keys, default operating-studio-stop
 #   FM_BOARD_LOOP_REMOTE_INVENTORY    path to a remote inventory fixture
 #   FM_LINEAR_CONFIG_FILE             narrow Linear env file (default .env.linear.local)
-#   FM_LINEAR_WRITE_API_KEY           write credential used only by `enforce`
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,15 +77,20 @@ MODE=scan
 CARDS_FILE=
 REMOTE_FILE=
 PAUSE_REASON=
+RESUME_CARD=
 LINEAR_CONFIG_FILE=${FM_LINEAR_CONFIG_FILE:-$FM_HOME/.env.linear.local}
 HISTORY="$STATE/.board-loop-deploy-history"
 STALL_LEDGER="$STATE/.board-loop-stall.tsv"
 RECOVERY_LEDGER="$STATE/.board-loop-recovery.jsonl"
 PAUSE_MARKER="$STATE/.board-loop-pause"
+RESUME_DIR="$STATE/.board-loop-resume"
 INVENTORY_SCHEMA='fm-board-inventory.v1'
 REPORT_SCHEMA='fm-board-loop.v1'
 DEPLOY_WINDOW_SECS=3600
-HISTORY_RETAIN_SECS=86400
+REMOTE_MAX_AGE_SECS=${FM_BOARD_LOOP_REMOTE_MAX_AGE_SECS:-1800}
+case "$REMOTE_MAX_AGE_SECS" in
+  ''|*[!0-9]*|0) REMOTE_MAX_AGE_SECS=1800 ;;
+esac
 STALL_SECS_DEFAULT=1800
 RECOVERY_RETRY_SECS=900
 RECOVERY_MAX_ATTEMPTS=3
@@ -107,9 +104,8 @@ usage() {
 usage: fm-board-loop.sh [scan] [--cards <file>] [--remote-inventory <file>]
        fm-board-loop.sh inventory
        fm-board-loop.sh recover [--cards <file>] [--remote-inventory <file>]
-       fm-board-loop.sh enforce [--cards <file>] [--remote-inventory <file>]
        fm-board-loop.sh pause [--reason <text>]
-       fm-board-loop.sh resume
+       fm-board-loop.sh resume --card <Linear-id-or-identifier>
 EOF
 }
 
@@ -118,9 +114,14 @@ while [ "$#" -gt 0 ]; do
     scan) MODE=scan ;;
     inventory) MODE=inventory ;;
     recover) MODE=recover ;;
-    enforce) MODE=enforce ;;
     pause) MODE=pause ;;
     resume) MODE=resume ;;
+    --card)
+      shift
+      [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+      RESUME_CARD=$1
+      ;;
+    --card=*) RESUME_CARD=${1#--card=} ;;
     --reason)
       shift
       [ "$#" -gt 0 ] || { usage >&2; exit 2; }
@@ -177,40 +178,34 @@ board_loop_pause_reason() {
   sed -n 's/^reason=//p' "$PAUSE_MARKER" 2>/dev/null | sed -n '/./{p;q;}'
 }
 
-# board_loop_stop_status_signal reports a configured stop-status file whose
-# newest line for a stop key is a paused or blocked declaration. A later
-# resolved/working/done/failed line for the same key clears it.
-board_loop_stop_status_signal() {
-  local f=${FM_BOARD_LOOP_STOP_STATUS:-} key line verb
-  [ -n "$f" ] && [ -f "$f" ] && [ ! -L "$f" ] || return 1
-  # shellcheck disable=SC2086
-  for key in ${FM_BOARD_LOOP_STOP_KEYS:-operating-studio-stop}; do
-    line=$(grep -F -- "[key=$key]" "$f" 2>/dev/null | tail -n 1)
-    [ -n "$line" ] || continue
-    status_line_verb "$line" verb
-    case "$verb" in
-      paused|blocked) return 0 ;;
-    esac
-  done
-  return 1
-}
-
-# board_loop_paused is the single guard read by the recovery path. It is true
-# when the durable pause marker exists, the process override is set, or a
-# configured stop-status file's newest stop-key line is paused/blocked. It never
-# consults endpoint liveness: a live endpoint is not evidence recovery is safe.
 board_loop_paused() {
   if [ -f "$PAUSE_MARKER" ] && [ ! -L "$PAUSE_MARKER" ]; then return 0; fi
   if [ "${FM_BOARD_LOOP_PAUSE:-}" = 1 ]; then return 0; fi
-  board_loop_stop_status_signal
+  [ -d "$RESUME_DIR" ] && [ ! -L "$RESUME_DIR" ] || return 0
+  return 1
+}
+
+board_loop_card_resumed() { # <card-id> <identifier>
+  local card=$1 identifier=$2 grant
+  board_loop_paused && return 1
+  for grant in "$card" "$identifier"; do
+    case "$grant" in ''|.*|*/*|*[!A-Za-z0-9._-]*) continue ;; esac
+    [ -f "$RESUME_DIR/$grant" ] && [ ! -L "$RESUME_DIR/$grant" ] && return 0
+  done
+  return 1
 }
 
 action_pause() {
   local tmp
   mkdir -p "$STATE" 2>/dev/null || true
+  if [ -e "$RESUME_DIR" ] && { [ ! -d "$RESUME_DIR" ] || [ -L "$RESUME_DIR" ]; }; then
+    printf 'fm-board-loop: unsafe resume ledger\n' >&2
+    return 1
+  fi
   tmp=$(umask 077; mktemp "$STATE/.board-loop-pause.XXXXXX") || return 1
   if printf 'since=%s\nreason=%s\n' "$NOW" "${PAUSE_REASON:-manual pause}" > "$tmp" \
-    && chmod 0600 "$tmp" && mv -f "$tmp" "$PAUSE_MARKER"; then
+    && chmod 0600 "$tmp" && mv -f "$tmp" "$PAUSE_MARKER" \
+    && { [ ! -d "$RESUME_DIR" ] || rm -f "$RESUME_DIR"/*; }; then
     printf 'paused: board recovery suspended (%s)\n' "${PAUSE_REASON:-manual pause}"
     return 0
   fi
@@ -220,8 +215,23 @@ action_pause() {
 }
 
 action_resume() {
-  rm -f "$PAUSE_MARKER"
-  printf 'resumed: board recovery re-enabled\n'
+  local tmp
+  case "$RESUME_CARD" in ''|.*|*/*|*[!A-Za-z0-9._-]*)
+    printf 'fm-board-loop: resume requires a safe --card value\n' >&2
+    return 1
+    ;;
+  esac
+  mkdir -p "$RESUME_DIR" || return 1
+  [ ! -L "$RESUME_DIR" ] || return 1
+  tmp=$(umask 077; mktemp "$RESUME_DIR/.resume.XXXXXX") || return 1
+  if printf 'since=%s\ncard=%s\n' "$NOW" "$RESUME_CARD" > "$tmp" \
+    && chmod 0600 "$tmp" && mv -f "$tmp" "$RESUME_DIR/$RESUME_CARD" \
+    && rm -f "$PAUSE_MARKER"; then
+    printf 'resumed: board recovery enabled for %s\n' "$RESUME_CARD"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
 }
 
 # --- external input boundaries ------------------------------------------------
@@ -235,7 +245,8 @@ crew_state_line() { # <task-id>
 }
 
 # pr_probe returns one compact JSON object for a canonical PR URL:
-#   {"state":"OPEN|MERGED|CLOSED","isDraft":bool,"headRefOid":"<sha>"}
+#   {"state":"OPEN|MERGED|CLOSED","isDraft":bool,"headRefOid":"<sha>",
+#    "checks":"green|red|pending|unknown","mergedAt":<epoch-or-null>}
 # An unavailable probe yields nothing, which the caller records as unknown.
 pr_probe() { # <pr-url>
   local url=$1 cmd=${FM_BOARD_LOOP_PR_PROBE_CMD:-}
@@ -246,7 +257,17 @@ pr_probe() { # <pr-url>
     return
   fi
   command -v gh >/dev/null 2>&1 || return 1
-  gh pr view "$url" --json state,isDraft,headRefOid 2>/dev/null
+  gh pr view "$url" --json state,isDraft,headRefOid,mergeStateStatus,statusCheckRollup,mergedAt 2>/dev/null \
+    | jq -c '
+      . as $pr
+      | {state,isDraft,headRefOid,
+         checks:(if (($pr.statusCheckRollup // []) | length) == 0 then "unknown"
+                 elif any($pr.statusCheckRollup[]; (.conclusion // .state // "")
+                   | IN("FAILURE","ERROR","CANCELLED","TIMED_OUT","ACTION_REQUIRED")) then "red"
+                 elif all($pr.statusCheckRollup[]; (.conclusion // .state // "")
+                   | IN("SUCCESS","NEUTRAL","SKIPPED")) then "green"
+                 else "pending" end),
+         mergedAt:(if ($pr.mergedAt // "") == "" then null else ($pr.mergedAt | fromdateiso8601) end)}'
 }
 
 # linear_cards returns a JSON array of the five active board columns, read from
@@ -300,64 +321,6 @@ linear_cards() {
   done
   rm -f "$page"
   printf '%s\n' "$cards"
-}
-
-linear_transition() { # <issue-id> <state-name>
-  local issue=$1 state_name=$2 key team payload page state_id
-  board_loop_paused && return 1
-  key=$(fmx_env_get FM_LINEAR_WRITE_API_KEY "$LINEAR_CONFIG_FILE")
-  [ -n "$key" ] || key=${FM_LINEAR_WRITE_API_KEY:-}
-  team=$(fmx_env_get FM_LINEAR_OPERATING_STUDIO_TEAM_ID "$LINEAR_CONFIG_FILE")
-  [ -n "$team" ] || team=${FM_LINEAR_OPERATING_STUDIO_TEAM_ID:-}
-  [ -n "$key" ] && [ -n "$team" ] || return 1
-  command -v curl >/dev/null 2>&1 || return 1
-  page=$(mktemp "${TMPDIR:-/tmp}/fm-board-loop-linear.XXXXXX") || return 1
-  payload=$(jq -cn --arg team "$team" '
-    {query:"query States($team: ID!) { workflowStates(filter:{team:{id:{eq:$team}}}) { nodes { id name } } }",
-     variables:{team:$team}}')
-  if ! curl --fail --silent --show-error --max-time 15 \
-      -H 'Content-Type: application/json' -H "Authorization: $key" \
-      --data "$payload" https://api.linear.app/graphql > "$page" 2>/dev/null; then
-    rm -f "$page"
-    return 1
-  fi
-  state_id=$(jq -r --arg name "$state_name" '
-    if (.errors // [] | length) == 0 then
-      [.data.workflowStates.nodes[] | select(.name == $name) | .id][0] // empty
-    else empty end' "$page" 2>/dev/null) || state_id=
-  [ -n "$state_id" ] || { rm -f "$page"; return 1; }
-  payload=$(jq -cn --arg issue "$issue" --arg state "$state_id" '
-    {query:"mutation Move($issue: String!, $state: String!) { issueUpdate(id:$issue,input:{stateId:$state}) { success issue { id state { name } } } }",
-     variables:{issue:$issue,state:$state}}')
-  if ! curl --fail --silent --show-error --max-time 15 \
-      -H 'Content-Type: application/json' -H "Authorization: $key" \
-      --data "$payload" https://api.linear.app/graphql > "$page" 2>/dev/null; then
-    rm -f "$page"
-    return 1
-  fi
-  if ! jq -e --arg issue "$issue" --arg state "$state_name" '
-      (.errors // [] | length) == 0 and .data.issueUpdate.success == true
-      and .data.issueUpdate.issue.id == $issue
-      and .data.issueUpdate.issue.state.name == $state' "$page" >/dev/null 2>&1; then
-    rm -f "$page"
-    return 1
-  fi
-  payload=$(jq -cn --arg issue "$issue" '
-    {query:"query Issue($issue: String!) { issue(id:$issue) { id state { name } } }",
-     variables:{issue:$issue}}')
-  if ! curl --fail --silent --show-error --max-time 15 \
-      -H 'Content-Type: application/json' -H "Authorization: $key" \
-      --data "$payload" https://api.linear.app/graphql > "$page" 2>/dev/null; then
-    rm -f "$page"
-    return 1
-  fi
-  if ! jq -e --arg issue "$issue" --arg state "$state_name" '
-      (.errors // [] | length) == 0 and .data.issue.id == $issue
-      and .data.issue.state.name == $state' "$page" >/dev/null 2>&1; then
-    rm -f "$page"
-    return 1
-  fi
-  rm -f "$page"
 }
 
 # --- herdr activity -----------------------------------------------------------
@@ -495,14 +458,15 @@ validation_source_lookup() { # <task-id>
 # --- decision ledger ----------------------------------------------------------
 
 # decision_state_of prints one TSV row per open or durably answered decision:
-#   <key>\t<verb>\t<delivered>\t<acknowledged>\t<ring-attempts>\t<progressed>
+#   <key>\t<verb>\t<delivered>\t<acknowledged>\t<ring-attempts>\t<progressed>\t<phase>
 # Answer records bind the exact key to the exact inbox record and status offset.
 # Delivery is never completion: a decision is consumed only once the worker
 # also reaches a productive or terminal disposition.
 decision_state_of() { # <task-id>
   local id=$1
   local status="$STATE/$id.status" inbox="$STATE/$id.inbox" records="$STATE/$id.decision-deliveries"
-  local key verb note delivered handed attempts f line msg count record basename baseline size progressed
+  local key verb note delivered handed attempts f line msg count record basename baseline size progressed phase open_set
+  open_set=$(status_open_decisions "$status" 2>/dev/null || true)
   while IFS=$'\t' read -r key verb note || [ -n "${key:-}" ]; do
     [ -n "$key" ] || continue
     delivered=0
@@ -517,17 +481,24 @@ decision_state_of() { # <task-id>
       attempts=$count
       [ -n "$msg" ] || attempts=$count
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t0\n' "$key" "$verb" "$delivered" "$handed" "$attempts"
-  done < <(status_open_decisions "$status" 2>/dev/null || true)
+    printf '%s\t%s\t%s\t%s\t%s\t0\topen\n' "$key" "$verb" "$delivered" "$handed" "$attempts"
+  done < <(printf '%s\n' "$open_set")
   if [ -d "$records" ] && [ ! -L "$records" ]; then
     for record in "$records"/*.record; do
       [ -f "$record" ] && [ ! -L "$record" ] || continue
       key=$(sed -n 's/^key=//p' "$record" | sed -n '/./{p;q;}')
       basename=$(sed -n 's/^inbox_record=//p' "$record" | sed -n '/./{p;q;}')
       baseline=$(sed -n 's/^status_size=//p' "$record" | sed -n '/./{p;q;}')
+      phase=$(sed -n 's/^phase=//p' "$record" | sed -n '/./{p;q;}')
       case "$key" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
       case "$basename" in ''|*/*|.*|*[!A-Za-z0-9._-]*) continue ;; esac
       case "$baseline" in ''|*[!0-9]*) baseline=0 ;; esac
+      case "$phase" in ''|committed) phase=committed ;; prepared)
+        case "$open_set" in
+          "$key"$'\t'* | *$'\n'"$key"$'\t'*) continue ;;
+        esac
+        ;; *) continue ;;
+      esac
       delivered=0
       handed=0
       if [ -f "$inbox/$basename" ] && [ ! -L "$inbox/$basename" ]; then delivered=1; fi
@@ -552,27 +523,29 @@ decision_state_of() { # <task-id>
         case "$count" in ''|*[!0-9]*) count=0 ;; esac
         attempts=$count
       fi
-      printf '%s\tanswered\t%s\t%s\t%s\t%s\n' "$key" "$delivered" "$handed" "$attempts" "$progressed"
+      printf '%s\tanswered\t%s\t%s\t%s\t%s\t%s\n' "$key" "$delivered" "$handed" "$attempts" "$progressed" "$phase"
     done
   fi
 }
 
 # --- lane and decision collection ---------------------------------------------
 
-lane_json() { # lane fields followed by agent/validation/forge source health
+lane_json() { # lane fields followed by PR and source-health evidence
   jq -cn \
     --arg task_id "$1" --arg kind "$2" --arg backend "$3" --arg endpoint "$4" \
     --arg linear_card_id "$5" --arg agent_status "$6" --arg endpoint_status "$7" \
     --arg disposition "$8" --arg validation "$9" --argjson terminal "${10}" \
     --arg pr "${11}" --arg pr_head "${12}" --arg pr_state "${13}" \
-    --argjson pr_draft "${14}" --arg pr_head_live "${15}" --arg status_verb "${16}" \
-    --argjson status_size "${17}" --arg agent_source "${18}" \
-    --arg validation_source "${19}" --arg forge_source "${20}" \
+    --argjson pr_draft "${14}" --arg pr_head_live "${15}" \
+    --arg pr_checks "${16}" --argjson pr_merged_at "${17}" --arg status_verb "${18}" \
+    --argjson status_size "${19}" --arg agent_source "${20}" \
+    --arg validation_source "${21}" --arg forge_source "${22}" \
     '{task_id:$task_id, kind:$kind, backend:$backend, endpoint:$endpoint,
       linear_card_id:$linear_card_id, agent_status:$agent_status,
       endpoint_status:$endpoint_status, disposition:$disposition,
       validation:$validation, terminal:$terminal, pr:$pr, pr_head:$pr_head,
       pr_state:$pr_state, pr_draft:$pr_draft, pr_head_live:$pr_head_live,
+      pr_checks:$pr_checks, pr_merged_at:$pr_merged_at,
       status_verb:$status_verb, status_size:$status_size,
       agent_source:$agent_source, validation_source:$validation_source,
       forge_source:$forge_source}'
@@ -581,7 +554,7 @@ lane_json() { # lane fields followed by agent/validation/forge source health
 collect_lanes() { # -> JSON array
   local meta id kind backend endpoint card session pane agent endstat
   local status verb disposition validation terminal pr pr_head
-  local pr_state pr_draft pr_head_live out lines=() status_size validation_source
+  local pr_state pr_draft pr_head_live pr_checks pr_merged_at out lines=() status_size validation_source
   local agent_source forge_source
   [ -d "$STATE" ] && [ ! -L "$STATE" ] || { printf '[]\n'; return 0; }
   for meta in "$STATE"/*.meta; do
@@ -620,6 +593,8 @@ collect_lanes() { # -> JSON array
     pr_state=unknown
     pr_draft=false
     pr_head_live=
+    pr_checks=unknown
+    pr_merged_at=0
     forge_source=not-required
     if [ -n "$pr" ]; then
       out=$(pr_probe "$pr") || out=
@@ -627,12 +602,19 @@ collect_lanes() { # -> JSON array
         pr_state=$(printf '%s' "$out" | jq -r '.state // "unknown"' 2>/dev/null) || pr_state=unknown
         pr_draft=$(printf '%s' "$out" | jq -r '.isDraft // false' 2>/dev/null) || pr_draft=false
         pr_head_live=$(printf '%s' "$out" | jq -r '.headRefOid // ""' 2>/dev/null) || pr_head_live=
+        pr_checks=$(printf '%s' "$out" | jq -r '.checks // "unknown"' 2>/dev/null) || pr_checks=unknown
+        pr_merged_at=$(printf '%s' "$out" | jq -r '
+          if (.mergedAt | type) == "number" then .mergedAt
+          elif (.mergedAt | type) == "string" then (.mergedAt | fromdateiso8601)
+          else 0 end' 2>/dev/null) || pr_merged_at=0
         if [ "$pr_state" = unknown ]; then forge_source=unavailable; else forge_source=available; fi
       else
         forge_source=unavailable
       fi
     fi
     case "$pr_draft" in true|false) ;; *) pr_draft=false ;; esac
+    case "$pr_checks" in green|red|pending|unknown) ;; *) pr_checks=unknown ;; esac
+    case "$pr_merged_at" in ''|*[!0-9]*) pr_merged_at=0 ;; esac
     if [ -f "$STATE/$id.status" ]; then
       status_size=$(wc -c < "$STATE/$id.status" 2>/dev/null | tr -d '[:space:]')
     else
@@ -641,11 +623,11 @@ collect_lanes() { # -> JSON array
     case "$status_size" in ''|*[!0-9]*) status_size=0 ;; esac
     if [ "$terminal" = 1 ]; then
       lines+=("$(lane_json "$id" "$kind" "$backend" "$endpoint" "$card" "$agent" "$endstat" \
-        "$disposition" "$validation" true "$pr" "$pr_head" "$pr_state" "$pr_draft" "$pr_head_live" "$verb" "$status_size" \
+        "$disposition" "$validation" true "$pr" "$pr_head" "$pr_state" "$pr_draft" "$pr_head_live" "$pr_checks" "$pr_merged_at" "$verb" "$status_size" \
         "$agent_source" "$validation_source" "$forge_source")")
     else
       lines+=("$(lane_json "$id" "$kind" "$backend" "$endpoint" "$card" "$agent" "$endstat" \
-        "$disposition" "$validation" false "$pr" "$pr_head" "$pr_state" "$pr_draft" "$pr_head_live" "$verb" "$status_size" \
+        "$disposition" "$validation" false "$pr" "$pr_head" "$pr_state" "$pr_draft" "$pr_head_live" "$pr_checks" "$pr_merged_at" "$verb" "$status_size" \
         "$agent_source" "$validation_source" "$forge_source")")
     fi
   done
@@ -660,14 +642,15 @@ collect_decisions() { # -> JSON array
     [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     id=${meta##*/}; id=${id%.meta}
     task_id_valid "$id" || continue
-    while IFS=$'\t' read -r key verb delivered handed attempts progressed; do
+    while IFS=$'\t' read -r key verb delivered handed attempts progressed phase; do
       [ -n "$key" ] || continue
       lines+=("$(jq -cn --arg task_id "$id" --arg key "$key" --arg verb "$verb" \
         --argjson delivered "$delivered" --argjson acknowledged "$handed" \
         --argjson ring_attempts "$attempts" --argjson progressed "$progressed" \
+        --arg phase "$phase" \
         '{task_id:$task_id, key:$key, verb:$verb, delivered:$delivered,
           acknowledged:$acknowledged, ring_attempts:$ring_attempts,
-          progressed:$progressed}')")
+          progressed:$progressed, phase:$phase}')")
     done < <(decision_state_of "$id")
   done
   [ "${#lines[@]}" -gt 0 ] || { printf '[]\n'; return 0; }
@@ -680,9 +663,15 @@ collect_remote() { # -> health envelope with inventories and merged lanes
     [ -f "$file" ] && [ ! -L "$file" ] || {
       printf '{"status":"unavailable","inventories":[],"lanes":[]}\n'; return 0;
     }
-    jq -ce '
+    jq -ce --argjson now "$NOW" --argjson max_age "$REMOTE_MAX_AGE_SECS" '
       (if type == "array" then . else [.] end) as $inventories
-      | if all($inventories[]; .schema == "fm-board-inventory.v1" and (.lanes | type) == "array")
+      | if ($inventories | length) > 0
+          and all($inventories[]; .schema == "fm-board-inventory.v1"
+            and (.home | type) == "string" and (.home | length) > 0
+            and (.owner_task | type) == "string" and (.owner_task | test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"))
+            and (.observed_at | type) == "number" and .observed_at <= $now
+            and ($now - .observed_at) <= $max_age
+            and (.lanes | type) == "array")
           and all($inventories[].lanes[];
             (.task_id | type) == "string" and (.linear_card_id | type) == "string"
             and (.backend | type) == "string" and (.endpoint | type) == "string"
@@ -691,7 +680,9 @@ collect_remote() { # -> health envelope with inventories and merged lanes
             and (.agent_source | type) == "string" and (.validation_source | type) == "string"
             and (.forge_source | type) == "string")
         then {status:"available", inventories:$inventories,
-              lanes:[$inventories[].lanes[]]}
+              lanes:[$inventories[] as $inv | $inv.lanes[]
+                | . + {owner_home:$inv.home, owner_task:$inv.owner_task,
+                       observed_at:$inv.observed_at}]}
         else error("invalid remote inventory") end' "$file" 2>/dev/null \
       || printf '{"status":"unavailable","inventories":[],"lanes":[]}\n'
     return 0
@@ -701,38 +692,25 @@ collect_remote() { # -> health envelope with inventories and merged lanes
 
 # --- deployment ledger --------------------------------------------------------
 
-history_prune() {
-  local tmp
-  if [ ! -f "$HISTORY" ] || [ -L "$HISTORY" ]; then
+history_prepare() {
+  [ ! -L "$HISTORY" ] || return 0
+  if [ ! -f "$HISTORY" ]; then
     : > "$HISTORY" 2>/dev/null || true
-    return 0
   fi
-  tmp=$(mktemp "$STATE/.board-loop-history.XXXXXX" 2>/dev/null) || return 0
-  if awk -F'\t' -v now="$NOW" -v keep="$HISTORY_RETAIN_SECS" '
-      NF >= 2 { ts=$1; if (ts ~ /^[0-9]+$/ && now - ts <= keep) print }
-    ' "$HISTORY" > "$tmp" 2>/dev/null && mv -f "$tmp" "$HISTORY" 2>/dev/null; then
-    return 0
-  fi
-  rm -f "$tmp"
 }
 
-# history_record appends one verified deployment without duplicating an
-# existing (card, head) pair, or an existing (card, pr) pair when the head is
-# unknown. Idempotent across reruns.
-history_record() { # <card-id> <pr-url> <head>
-  local card=$1 pr=$2 head=$3
-  [ -n "$card" ] || return 0
+# history_record appends one exact-head deployment without duplicating its
+# permanent card/head identity. Idempotent across reruns.
+history_record() { # <card-id> <pr-url> <head> <merged-at>
+  local card=$1 pr=$2 head=$3 merged_at=$4
+  [ -n "$card" ] && [ -n "$head" ] || return 0
+  case "$merged_at" in ''|*[!0-9]*|0) return 0 ;; esac
+  [ "$merged_at" -le "$NOW" ] || return 0
   [ -f "$HISTORY" ] && [ ! -L "$HISTORY" ] || : > "$HISTORY" 2>/dev/null || true
-  if [ -n "$head" ]; then
-    if awk -F'\t' -v c="$card" -v h="$head" 'NF >= 4 && $2 == c && $4 == h { found=1 } END { exit found ? 0 : 1 }' "$HISTORY" 2>/dev/null; then
-      return 0
-    fi
-  else
-    if awk -F'\t' -v c="$card" -v p="$pr" 'NF >= 3 && $2 == c && $3 == p { found=1 } END { exit found ? 0 : 1 }' "$HISTORY" 2>/dev/null; then
-      return 0
-    fi
+  if awk -F'\t' -v c="$card" -v h="$head" 'NF >= 4 && $2 == c && $4 == h { found=1 } END { exit found ? 0 : 1 }' "$HISTORY" 2>/dev/null; then
+    return 0
   fi
-  printf '%s\t%s\t%s\t%s\n' "$NOW" "$card" "$pr" "$head" >> "$HISTORY" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\n' "$merged_at" "$card" "$pr" "$head" >> "$HISTORY" 2>/dev/null || true
 }
 
 history_json() {
@@ -776,11 +754,16 @@ lane_history_write() { # reads the report JSON on stdin
 # --- inventory mode -----------------------------------------------------------
 
 emit_inventory() {
-  local lanes
+  local lanes owner_task=
   prepare_validations
   lanes=$(collect_lanes)
-  jq -cn --arg home "$FM_HOME" --argjson lanes "$lanes" \
-    '{schema:"'"$INVENTORY_SCHEMA"'", home:$home, lanes:$lanes}'
+  if [ -f "$FM_HOME/.fm-secondmate-home" ] && [ ! -L "$FM_HOME/.fm-secondmate-home" ]; then
+    owner_task=$(sed -n '/./{p;q;}' "$FM_HOME/.fm-secondmate-home" 2>/dev/null)
+  fi
+  jq -cn --arg home "$FM_HOME" --arg owner_task "$owner_task" --argjson observed_at "$NOW" \
+    --argjson lanes "$lanes" \
+    '{schema:"'"$INVENTORY_SCHEMA"'", home:$home, owner_task:$owner_task,
+      observed_at:$observed_at, lanes:$lanes}'
 }
 
 # --- classification -----------------------------------------------------------
@@ -856,6 +839,13 @@ classify() { # cards, lanes, decisions, remote envelope, history, previous lanes
                  detail:"reviewed candidate is Ready to Merge but not landed",
                  recovery:{kind:"escalate", target:$l.task_id,
                    reason:"land the reviewed candidate serially and verify the readback"}}
+              elif $c.state == "Ready to Merge" and $l.pr_state == "MERGED"
+                   and $l.pr_head_live == $l.pr_head then
+                {kind:"merged-pr-awaiting-linear-readback", task_id:$l.task_id,
+                 card_id:$c.id, identifier:$c.identifier, card_state:$c.state,
+                 detail:"the exact reviewed head is merged but Linear still says Ready to Merge",
+                 recovery:{kind:"escalate", target:$l.task_id,
+                   reason:"have the serial merge owner complete and verify the Linear transition"}}
               elif $c.state == "Ready to Deploy" and ($l.pr_state != "MERGED"
                    or $l.pr_head_live != $l.pr_head) then
                 {kind:"ready-to-deploy-unverified", task_id:$l.task_id, card_id:$c.id,
@@ -863,8 +853,25 @@ classify() { # cards, lanes, decisions, remote envelope, history, previous lanes
                  detail:"card is Ready to Deploy without a merged canonical PR",
                  recovery:{kind:"escalate", target:$l.task_id,
                    reason:"verify the landing before counting this card as deployed"}}
+              elif $c.state == "Ready to Deploy" and $l.pr_merged_at <= 0 then
+                {kind:"merge-time-unverified", task_id:$l.task_id, card_id:$c.id,
+                 identifier:$c.identifier, card_state:$c.state,
+                 detail:"the exact merged head has no authoritative merge time",
+                 recovery:{kind:"escalate", target:$l.task_id,
+                   reason:"restore merge-time evidence before counting throughput"}}
               elif $l.pr != "" and $c.state == "In Progress" and $l.pr_state == "OPEN"
                    and $l.pr_draft == false
+                   and ($l.disposition == "done" or $l.disposition == "terminal"
+                        or $l.agent_status == "idle" or $l.agent_status == "done")
+                   and ($l.pr_checks != "green" or $l.validation != "green") then
+                {kind:"pr-not-green", task_id:$l.task_id, card_id:$c.id,
+                 identifier:$c.identifier, card_state:$c.state,
+                 detail:"the open PR lacks green forge checks and green lane validation",
+                 recovery:{kind:"escalate", target:$l.task_id,
+                   reason:"finish validation before requesting independent review"}}
+              elif $l.pr != "" and $c.state == "In Progress" and $l.pr_state == "OPEN"
+                   and $l.pr_draft == false
+                   and $l.pr_checks == "green" and $l.validation == "green"
                    and ($l.disposition == "done" or $l.disposition == "terminal"
                         or $l.agent_status == "idle" or $l.agent_status == "done") then
                 {kind:"green-pr-not-in-review", task_id:$l.task_id, card_id:$c.id,
@@ -919,31 +926,42 @@ classify() { # cards, lanes, decisions, remote envelope, history, previous lanes
       ] as $card_causes
     | [ $decisions[] as $d
         | ($joined | map(select(.task_id == $d.task_id)) | .[0]) as $l
-        | if $d.verb == "blocked" then
+        | if $d.phase == "prepared" then
+            {kind:"decision-tracking-incomplete", task_id:$d.task_id,
+             card_id:($l.linear_card_id // null), identifier:($l.card_identifier // null),
+             detail:"decision closed with a durable prepared binding that was not committed",
+             recovery:{kind:"escalate", target:$d.task_id,
+               reason:("repair acknowledgement tracking for decision key " + $d.key)}}
+          elif $d.verb == "blocked" then
             if $d.delivered != 1 then
-              {kind:"blocked-undelivered", task_id:$d.task_id, card_id:null, identifier:null,
+              {kind:"blocked-undelivered", task_id:$d.task_id,
+               card_id:($l.linear_card_id // null), identifier:($l.card_identifier // null),
                detail:"blocker recorded but the clearing instruction never reached the worker inbox",
                recovery:{kind:"steer", target:$d.task_id,
                  reason:("clear blocker key " + $d.key + " and verify acknowledgement")}}
             else
-              {kind:"blocked-lane", task_id:$d.task_id, card_id:null, identifier:null,
+              {kind:"blocked-lane", task_id:$d.task_id,
+               card_id:($l.linear_card_id // null), identifier:($l.card_identifier // null),
                detail:("lane reports a blocker: " + ($d.key // "default")),
                recovery:{kind:"escalate", target:$d.task_id,
                  reason:("clear or reassign the blocker for key " + $d.key)}}
             end
           elif $d.delivered != 1 then
-            {kind:"decision-recorded-undelivered", task_id:$d.task_id, card_id:null,
-             identifier:null, detail:"decision recorded but not delivered to the worker inbox",
+            {kind:"decision-recorded-undelivered", task_id:$d.task_id,
+             card_id:($l.linear_card_id // null), identifier:($l.card_identifier // null),
+             detail:"decision recorded but not delivered to the worker inbox",
              recovery:{kind:"steer", target:$d.task_id,
                reason:("answer decision key " + $d.key + " and verify acknowledgement")}}
           elif $d.acknowledged != 1 and $d.ring_attempts >= 3 then
-            {kind:"decision-delivered-unacknowledged", task_id:$d.task_id, card_id:null,
-             identifier:null, detail:"decision delivered but unacknowledged after the bounded ring ladder",
+            {kind:"decision-delivered-unacknowledged", task_id:$d.task_id,
+             card_id:($l.linear_card_id // null), identifier:($l.card_identifier // null),
+             detail:"decision delivered but unacknowledged after the bounded ring ladder",
              recovery:{kind:"escalate", target:$d.task_id,
                reason:"deliver the decision through a reachable channel and verify acknowledgement"}}
           elif $d.acknowledged != 1 then
-            {kind:"decision-delivered-unacknowledged", task_id:$d.task_id, card_id:null,
-             identifier:null, detail:"decision delivered but the worker has not acknowledged it",
+            {kind:"decision-delivered-unacknowledged", task_id:$d.task_id,
+             card_id:($l.linear_card_id // null), identifier:($l.card_identifier // null),
+             detail:"decision delivered but the worker has not acknowledged it",
              recovery:{kind:"steer", target:$d.task_id,
                reason:("acknowledge and consume decision key " + $d.key)}}
           elif $d.acknowledged == 1 and $l != null
@@ -982,11 +1000,6 @@ classify() { # cards, lanes, decisions, remote envelope, history, previous lanes
            detail:"remote lane inventory is unavailable or invalid",
            recovery:{kind:"escalate",target:null,reason:"restore the remote inventory feed"}}
         else empty end,
-        if $sources.linear_write == "unavailable" then
-          {kind:"source-unavailable", task_id:null, card_id:null, identifier:null,
-           detail:"Linear write access is unavailable for enforcement",
-           recovery:{kind:"escalate",target:null,reason:"configure the board owner Linear write credential"}}
-        else empty end,
         if any($joined[]; .validation_source == "unavailable") then
           {kind:"source-unavailable", task_id:null, card_id:null, identifier:null,
            detail:"crew-state validation is unavailable for one or more lanes",
@@ -1014,14 +1027,14 @@ classify() { # cards, lanes, decisions, remote envelope, history, previous lanes
           eligible_active:$eligible_active},
         throughput:{window_seconds:$window, ready_to_deploy:$rtd,
           verified_ready_to_deploy:$landed,
-          fault:(($landed == 0 and $eligible_active > 0) and ($paused | not))},
+          fault:($landed == 0 and $eligible_active > 0)},
         paused:$paused,
         pause_reason:$pause_reason,
         sources:$sources,
         decisions:($decisions),
         remote:($remote_rows),
         summary:{cards:($cards | length), causes:($causes | length),
-          end_to_end_fault:((($landed == 0 and $eligible_active > 0) and ($paused | not))
+          end_to_end_fault:(($landed == 0 and $eligible_active > 0)
             or any($causes[]; .kind == "endpoint-unavailable" or .kind == "source-unavailable"))}
       }'
 }
@@ -1054,10 +1067,10 @@ recovery_ledger_sync() { # <active task/reason TSV on stdin>
     && mv -f "$tmp" "$RECOVERY_LEDGER" || { rm -f "$tmp"; return 1; }
 }
 
-recover_target() { # <task-id> <reason>
-  local id=$1 reason=$2 sig send_cmd=${FM_BOARD_LOOP_SEND_CMD:-$SCRIPT_DIR/fm-send.sh}
+recover_target() { # <task-id> <reason> <card-id> <identifier>
+  local id=$1 reason=$2 card=$3 identifier=$4 sig send_cmd=${FM_BOARD_LOOP_SEND_CMD:-$SCRIPT_DIR/fm-send.sh}
   local row attempts last tmp
-  board_loop_paused && return 1
+  board_loop_card_resumed "$card" "$identifier" || return 1
   task_id_valid "$id" || return 1
   sig=$(recovery_signature "$reason")
   [ -n "$sig" ] || return 1
@@ -1086,44 +1099,35 @@ case "$MODE" in
   inventory)
     emit_inventory
     ;;
-  scan|recover|enforce)
-    history_prune
+  scan|recover)
+    history_prepare
     if CARDS=$(linear_cards); then LINEAR_HEALTH=available; else CARDS='[]'; LINEAR_HEALTH=unavailable; fi
     prepare_validations
     LOCAL_LANES=$(collect_lanes)
     DECISIONS=$(collect_decisions)
     REMOTE=$(collect_remote)
-    LANES=$(jq -cn --argjson local "$LOCAL_LANES" --argjson remote "$REMOTE" \
-      '$local + $remote.lanes')
-    WRITE_HEALTH=not-required
-    if [ "$MODE" = enforce ]; then
-      WRITE_KEY=$(fmx_env_get FM_LINEAR_WRITE_API_KEY "$LINEAR_CONFIG_FILE")
-      [ -n "$WRITE_KEY" ] || WRITE_KEY=${FM_LINEAR_WRITE_API_KEY:-}
-      if [ -n "$WRITE_KEY" ] && command -v curl >/dev/null 2>&1; then
-        WRITE_HEALTH=available
-      else
-        WRITE_HEALTH=unavailable
-      fi
-    fi
-    SOURCES=$(jq -cn --arg linear "$LINEAR_HEALTH" --arg linear_write "$WRITE_HEALTH" \
+    LANES=$(jq -cn --arg home "$FM_HOME" --argjson local "$LOCAL_LANES" --argjson remote "$REMOTE" \
+      '($local | map(. + {owner_home:$home, owner_task:"", observed_at:null})) + $remote.lanes')
+    SOURCES=$(jq -cn --arg linear "$LINEAR_HEALTH" \
       --arg remote "$(printf '%s' "$REMOTE" | jq -r '.status')" \
-      '{linear:$linear,linear_write:$linear_write,remote:$remote}')
+      '{linear:$linear,remote:$remote}')
 
     # Record newly verified Ready to Deploy cards before the throughput read so
     # this pass's own verified landings count inside the rolling hour.
-    while IFS=$'\t' read -r card pr head; do
+    while IFS=$'\t' read -r card pr head merged_at; do
       [ -n "$card" ] || continue
-      history_record "$card" "$pr" "$head"
+      history_record "$card" "$pr" "$head" "$merged_at"
     done < <(jq -r --argjson lanes "$LANES" '
       .[] as $c
       | select($c.state == "Ready to Deploy")
-      | ($lanes | map(select(.linear_card_id == $c.id and .pr != ""
-          and .pr_state == "MERGED" and .pr_head != ""
-          and .pr_head_live == .pr_head)) | .[0]) as $l
-      | select($l != null)
-      | [$c.id, $l.pr, $l.pr_head_live] | @tsv
+      | ($lanes | map(select(.linear_card_id == $c.id))) as $owners
+      | select(($owners | length) == 1)
+      | $owners[0] as $l
+      | select($l.pr != ""
+          and $l.pr_state == "MERGED" and $l.pr_head != ""
+          and $l.pr_head_live == $l.pr_head and $l.pr_merged_at > 0)
+      | [$c.id, $l.pr, $l.pr_head_live, $l.pr_merged_at] | @tsv
     ' < <(printf '%s' "$CARDS") 2>/dev/null || true)
-    history_prune
 
     PREV_LANES=$(lane_history_json)
     if board_loop_paused; then PAUSED=true; else PAUSED=false; fi
@@ -1136,34 +1140,20 @@ case "$MODE" in
         printf 'fm-board-loop: recovery is paused; no recovery steer was sent\n' >&2
       else
         printf '%s' "$REPORT" | jq -r '
-          .causes[] | select(.recovery.kind == "steer")
-          | [.recovery.target, (.recovery.reason // .detail)] | @tsv' \
+          .causes[] as $cause | select($cause.recovery.kind == "steer")
+          | ([.lanes[] | select(.task_id == $cause.task_id)][0]) as $lane
+          | [(if (($lane.owner_task // "") != "") then $lane.owner_task else $cause.recovery.target end),
+             ($cause.recovery.reason // $cause.detail)] | @tsv' \
           | recovery_ledger_sync
-        while IFS=$'\t' read -r target reason; do
+        while IFS=$'\t' read -r target reason card identifier; do
           [ -n "$target" ] || continue
-          recover_target "$target" "$reason" || true
+          recover_target "$target" "$reason" "$card" "$identifier" || true
         done < <(printf '%s' "$REPORT" | jq -r '
-          .causes[] | select(.recovery.kind == "steer")
-          | [.recovery.target, (.recovery.reason // .detail)] | @tsv')
-      fi
-    fi
-    if [ "$MODE" = enforce ]; then
-      if board_loop_paused; then
-        printf 'fm-board-loop: enforcement is paused; no Linear transition was sent\n' >&2
-      elif [ "$LINEAR_HEALTH" = available ]; then
-        while IFS=$'\t' read -r card state; do
-          [ -n "$card" ] || continue
-          linear_transition "$card" "$state" || true
-        done < <(printf '%s' "$REPORT" | jq -r '
-          .causes[] | select(.kind == "green-pr-not-in-review")
-          | [.card_id, "In Review"] | @tsv')
-        while IFS=$'\t' read -r card state; do
-          [ -n "$card" ] || continue
-          linear_transition "$card" "$state" || true
-        done < <(printf '%s' "$REPORT" | jq -r '
-          .lanes[] | select(.card_state == "Ready to Merge" and .pr_state == "MERGED"
-            and .pr_head != "" and .pr_head_live == .pr_head)
-          | [.linear_card_id, "Ready to Deploy"] | @tsv')
+          .causes[] as $cause | select($cause.recovery.kind == "steer")
+          | ([.lanes[] | select(.task_id == $cause.task_id)][0]) as $lane
+          | [(if (($lane.owner_task // "") != "") then $lane.owner_task else $cause.recovery.target end),
+             ($cause.recovery.reason // $cause.detail), ($cause.card_id // ""),
+             ($cause.identifier // "")] | @tsv')
       fi
     fi
     printf '%s\n' "$REPORT"

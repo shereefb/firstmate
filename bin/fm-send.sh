@@ -727,12 +727,13 @@ fm_send_close_resolved_keys() { # <answer-text>
   done
 }
 
-fm_send_record_decision_delivery() { # <inbox-record>
-  local inbox_record=$1 basename dir key size tmp
+fm_send_record_decision_delivery() { # <inbox-record> <prepared|committed>
+  local inbox_record=$1 phase=$2 basename dir key size tmp
   [ -n "$RESOLVE_STATUS_KEYS" ] || return 0
+  case "$phase" in prepared|committed) ;; *) return 1 ;; esac
   basename=${inbox_record##*/}
   case "$basename" in ''|*/*|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac
-  if [ -f "$RESOLVE_STATUS_FILE" ] && [ ! -L "$RESOLVE_STATUS_FILE" ]; then
+  if [ "$phase" = committed ] && [ -f "$RESOLVE_STATUS_FILE" ] && [ ! -L "$RESOLVE_STATUS_FILE" ]; then
     size=$(LC_ALL=C awk -v keys=" $RESOLVE_STATUS_KEYS " '
       BEGIN { count=split(keys, wanted, " ") }
       { bytes += length($0) + 1
@@ -748,8 +749,8 @@ fm_send_record_decision_delivery() { # <inbox-record>
   [ ! -L "$dir" ] || return 1
   for key in $RESOLVE_STATUS_KEYS; do
     tmp=$(umask 077; mktemp "$dir/.delivery.XXXXXX") || return 1
-    if ! printf 'schema=fm-decision-delivery.v1\nkey=%s\ninbox_record=%s\nstatus_size=%s\n' \
-        "$key" "$basename" "$size" > "$tmp" \
+    if ! printf 'schema=fm-decision-delivery.v1\nphase=%s\nkey=%s\ninbox_record=%s\nstatus_size=%s\n' \
+        "$phase" "$key" "$basename" "$size" > "$tmp" \
       || ! chmod 0600 "$tmp" \
       || ! mv -f "$tmp" "$dir/$key.record"; then
       rm -f "$tmp"
@@ -839,6 +840,24 @@ else
   # The pre-marker answer text, kept for the closing resolved note so the
   # durable ledger records the plain answer without marker or corr bytes.
   RESOLVE_ANSWER_TEXT=$MESSAGE
+  if [ -n "$RESOLVE_KEYS" ]; then
+    if [ "$TARGET_BACKEND" = remote ]; then
+      echo "error: --resolve-key requires the owning home's local durable inbox; answer this key from that home" >&2
+      exit 1
+    fi
+    case "$RESOLVE_ANSWER_TEXT" in
+      /*)
+        echo "error: --resolve-key cannot use a parser-native command because it would have no durable inbox acknowledgement record" >&2
+        exit 1
+        ;;
+      \$*)
+        if [ "$TARGET_HARNESS" = codex ]; then
+          echo "error: --resolve-key cannot use a parser-native skill invocation because it would have no durable inbox acknowledgement record" >&2
+          exit 1
+        fi
+        ;;
+    esac
+  fi
   if [ "$MARK_FROM_FIRSTMATE" = 1 ] && [ -n "$FIRE_AND_FORGET_ID" ]; then
     fm_message_mark_from_firstmate "$MESSAGE" MESSAGE
     MESSAGE="${FM_FROMFIRST_MARK}delivery=${FIRE_AND_FORGET_ID} ${MESSAGE#"$FM_FROMFIRST_MARK"}"
@@ -918,6 +937,11 @@ else
       *) INBOX_PLANE=1 ;;
       esac
     fi
+  fi
+  if [ -n "$RESOLVE_KEYS" ] \
+    && { [ "$INBOX_PLANE" -ne 1 ] || [ "$TARGET_BACKEND" = remote ]; }; then
+    echo "error: --resolve-key requires a local durable inbox record so its exact delivery can be acknowledged; answer this key from the owning home with ordinary text" >&2
+    exit 1
   fi
   if [ "$INBOX_PLANE" = 1 ] && [ "$TARGET_BACKEND" = remote ]; then
     # Remote inbox leg: the message becomes a durable record in the remote
@@ -1107,9 +1131,13 @@ else
     # The answer is durably sent: close each answered decision at enqueue time
     # (answerer-closes; see the header contract).
     if [ -n "$RESOLVE_KEYS" ]; then
+      fm_send_record_decision_delivery "$INBOX_RECORD" prepared || {
+        echo "error: the answer was delivered, but its durable decision binding could not be prepared; the decision remains open and the answer must not be resent" >&2
+        exit 1
+      }
       fm_send_close_resolved_keys "$RESOLVE_ANSWER_TEXT" || exit 1
-      fm_send_record_decision_delivery "$INBOX_RECORD" || {
-        echo "error: the answer was delivered and the decision closed, but its acknowledgement record could not be written; do not resend" >&2
+      fm_send_record_decision_delivery "$INBOX_RECORD" committed || {
+        echo "error: the answer was delivered and the decision closed, but its prepared acknowledgement binding could not be committed; do not resend" >&2
         exit 1
       }
       fm_send_feed_resolved_holds "$RESOLVE_ANSWER_TEXT" || exit 1
