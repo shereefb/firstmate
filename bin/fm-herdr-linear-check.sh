@@ -15,6 +15,8 @@ CHECK_SHIM="$STATE/$CHECK_ID.check.sh"
 RECORD="$STATE/.herdr-linear-reconcile-check"
 ENV_FILE="$FM_HOME/.env"
 INTERVAL=900
+OUTPUT_FILE=
+ERROR_FILE=
 
 # shellcheck source=bin/fm-pr-lib.sh
 . "$SCRIPT_DIR/fm-pr-lib.sh"
@@ -24,6 +26,22 @@ INTERVAL=900
 . "$SCRIPT_DIR/fm-env-lib.sh"
 # shellcheck source=bin/fm-primary-scope-lib.sh
 . "$SCRIPT_DIR/fm-primary-scope-lib.sh"
+# shellcheck source=bin/fm-secondmate-parent-lib.sh
+. "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
+# shellcheck source=bin/fm-secondmate-registry-lib.sh
+. "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
+
+cleanup() {
+  [ -z "$OUTPUT_FILE" ] || rm -f -- "$OUTPUT_FILE"
+  [ -z "$ERROR_FILE" ] || rm -f -- "$ERROR_FILE"
+  OUTPUT_FILE=
+  ERROR_FILE=
+}
+
+trap cleanup EXIT
+trap 'exit 124' HUP INT TERM
 
 usage() {
   cat <<'EOF'
@@ -39,6 +57,13 @@ owner_valid() {
   fm_root_is_secondmate_home "$FM_HOME" || return 1
   owner=$(cat "$FM_HOME/.fm-secondmate-home" 2>/dev/null) || return 1
   [ "$owner" = buildboard ]
+}
+
+primary_data_dir() {
+  fm_secondmate_parent_record_parse "$FM_HOME/.fm-secondmate-parent" || return 1
+  [ "$FM_SECONDMATE_PARENT_ROUTE" = local ] || return 1
+  [ -n "$FM_SECONDMATE_PARENT_HOME" ] || return 1
+  printf '%s/data\n' "$FM_SECONDMATE_PARENT_HOME"
 }
 
 now_epoch() {
@@ -74,17 +99,34 @@ one_line() {
   printf '%s' "$1" | LC_ALL=C tr '\t\r\n' '   ' | cut -c1-1000
 }
 
-credential_value() {
-  local key=$1 current=$2
-  if [ -n "$current" ]; then
-    printf '%s' "$current"
-  else
-    fmx_env_get "$key" "$ENV_FILE"
+finish_check() {
+  local epoch=$1 line=$2
+  if ! record_write "$epoch" 2>/dev/null; then
+    if [ -n "$line" ]; then
+      line="$line; cadence state could not be saved, inspect buildboard state permissions and rerun the check"
+    else
+      line='Operating Studio reconciliation check failed: cadence state could not be saved; inspect buildboard state permissions and rerun the check'
+    fi
   fi
+  [ -z "$line" ] || printf '%s\n' "$(one_line "$line")"
+}
+
+load_linear_config() {
+  LINEAR_READONLY_API_KEY=$(fmx_env_get FM_LINEAR_READONLY_API_KEY "$ENV_FILE")
+  LINEAR_TEAM_ID=$(fmx_env_get FM_LINEAR_OPERATING_STUDIO_TEAM_ID "$ENV_FILE")
+  LINEAR_PROJECT_ID=$(fmx_env_get FM_LINEAR_OPERATING_STUDIO_PROJECT_ID "$ENV_FILE")
+  [ -n "$LINEAR_READONLY_API_KEY" ] && [ -n "$LINEAR_TEAM_ID" ] && [ -n "$LINEAR_PROJECT_ID" ]
+}
+
+internal_budget() {
+  local timeout=${FM_CHECK_TIMEOUT:-30}
+  case "$timeout" in ''|*[!0-9]*|0) timeout=30 ;; esac
+  [ "$timeout" -ge 4 ] || return 1
+  printf '%s\n' "$((timeout - 3))"
 }
 
 action_check() {
-  local now previous api_key team_id project_id output_file error_file detail count rc
+  local now previous primary_data detail count rc budget line=
   now=$(now_epoch)
   previous=$(record_epoch)
   if [ "$previous" -gt 0 ] && [ "$now" -ge "$previous" ] \
@@ -93,49 +135,60 @@ action_check() {
   fi
 
   if ! owner_valid; then
-    printf '%s\n' 'Operating Studio reconciliation check failed: this trusted check must run from the persistent buildboard home; retire it here and arm it from buildboard'
-    record_write "$now" 2>/dev/null || true
+    finish_check "$now" 'Operating Studio reconciliation check failed: this trusted check must run from the persistent buildboard home; retire it here and arm it from buildboard'
     return 0
   fi
 
-  api_key=$(credential_value FM_LINEAR_READONLY_API_KEY "${FM_LINEAR_READONLY_API_KEY:-}")
-  team_id=$(credential_value FM_LINEAR_OPERATING_STUDIO_TEAM_ID "${FM_LINEAR_OPERATING_STUDIO_TEAM_ID:-}")
-  project_id=$(credential_value FM_LINEAR_OPERATING_STUDIO_PROJECT_ID "${FM_LINEAR_OPERATING_STUDIO_PROJECT_ID:-}")
-  if [ -z "$api_key" ] || [ -z "$team_id" ] || [ -z "$project_id" ]; then
-    printf '%s\n' 'Operating Studio reconciliation check failed: buildboard .env needs FM_LINEAR_READONLY_API_KEY, FM_LINEAR_OPERATING_STUDIO_TEAM_ID, and FM_LINEAR_OPERATING_STUDIO_PROJECT_ID; add them and rerun the check'
-    record_write "$now" 2>/dev/null || true
+  if ! primary_data=$(primary_data_dir); then
+    finish_check "$now" 'Operating Studio reconciliation check failed: buildboard needs a valid local parent binding to the primary Zeus registry; repair the binding and rerun the check'
+    return 0
+  fi
+  if ! load_linear_config; then
+    finish_check "$now" 'Operating Studio reconciliation check failed: buildboard .env needs FM_LINEAR_READONLY_API_KEY, FM_LINEAR_OPERATING_STUDIO_TEAM_ID, and FM_LINEAR_OPERATING_STUDIO_PROJECT_ID; add them and rerun the check'
+    return 0
+  fi
+  if ! budget=$(internal_budget); then
+    finish_check "$now" 'Operating Studio reconciliation check failed: FM_CHECK_TIMEOUT must be at least 4 seconds; raise it and rerun the check'
     return 0
   fi
 
-  output_file=$(mktemp "$STATE/.fm-herdr-linear-output.XXXXXX") || {
-    printf '%s\n' 'Operating Studio reconciliation check failed: could not create private result storage; inspect buildboard state permissions and rerun the check'
+  OUTPUT_FILE=$(mktemp "$STATE/.fm-herdr-linear-output.XXXXXX") || {
+    finish_check "$now" 'Operating Studio reconciliation check failed: could not create private result storage; inspect buildboard state permissions and rerun the check'
     return 0
   }
-  error_file=$(mktemp "$STATE/.fm-herdr-linear-error.XXXXXX") || {
-    rm -f -- "$output_file"
-    printf '%s\n' 'Operating Studio reconciliation check failed: could not create private error storage; inspect buildboard state permissions and rerun the check'
+  ERROR_FILE=$(mktemp "$STATE/.fm-herdr-linear-error.XXXXXX") || {
+    cleanup
+    finish_check "$now" 'Operating Studio reconciliation check failed: could not create private error storage; inspect buildboard state permissions and rerun the check'
     return 0
   }
-  LINEAR_API_KEY="$api_key" \
-    FM_LINEAR_OPERATING_STUDIO_TEAM_ID="$team_id" \
-    FM_LINEAR_OPERATING_STUDIO_PROJECT_ID="$project_id" \
-    "$SCRIPT_DIR/fm-herdr-linear-reconcile.sh" --linear-api > "$output_file" 2> "$error_file"
+  export LINEAR_API_KEY="$LINEAR_READONLY_API_KEY"
+  export FM_LINEAR_OPERATING_STUDIO_TEAM_ID="$LINEAR_TEAM_ID"
+  export FM_LINEAR_OPERATING_STUDIO_PROJECT_ID="$LINEAR_PROJECT_ID"
+  export FM_STATE_OVERRIDE="$STATE"
+  export FM_DATA_OVERRIDE="$primary_data"
+  fm_run_timed "$budget" "$SCRIPT_DIR/fm-herdr-linear-reconcile.sh" --linear-api \
+    > "$OUTPUT_FILE" 2> "$ERROR_FILE"
   rc=$?
+  unset LINEAR_API_KEY FM_LINEAR_OPERATING_STUDIO_TEAM_ID FM_LINEAR_OPERATING_STUDIO_PROJECT_ID FM_STATE_OVERRIDE FM_DATA_OVERRIDE
   if [ "$rc" -ne 0 ]; then
-    detail=$(sed -n '/./{p;q;}' "$error_file")
-    [ -n "$detail" ] || detail="reconciliation exited $rc without a diagnostic"
-    printf 'Operating Studio reconciliation check failed: %s; run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard\n' "$(one_line "$detail")"
+    if [ "$rc" -eq 124 ]; then
+      detail="reconciliation exceeded its ${budget}-second internal budget"
+    else
+      detail=$(sed -n '/./{p;q;}' "$ERROR_FILE")
+      [ -n "$detail" ] || detail="reconciliation exited $rc without a diagnostic"
+    fi
+    line="Operating Studio reconciliation check failed: $(one_line "$detail"); run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard"
   elif ! count=$(jq -er '
       select(.schema == "fm-herdr-linear-reconcile.v1")
       | .summary.needs_deep_check
       | select(type == "number" and . >= 0 and floor == .)
-    ' "$output_file" 2>/dev/null); then
-    printf '%s\n' 'Operating Studio reconciliation check failed: reconciliation returned an invalid result; run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard'
+    ' "$OUTPUT_FILE" 2>/dev/null); then
+    line='Operating Studio reconciliation check failed: reconciliation returned an invalid result; run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard'
   elif [ "$count" -gt 0 ]; then
-    printf 'Operating Studio reconciliation needs deep inspection: %s discrepancy(s); run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard\n' "$count"
+    line="Operating Studio reconciliation needs deep inspection: $count discrepancy(s); run bin/fm-herdr-linear-reconcile.sh --linear-api from buildboard"
   fi
-  rm -f -- "$output_file" "$error_file"
-  record_write "$now" 2>/dev/null || true
+  cleanup
+  finish_check "$now" "$line"
   return 0
 }
 
@@ -149,17 +202,24 @@ shim_content() {
 }
 
 action_arm() {
-  local home want device tmp key
+  local home want device tmp primary_data
   owner_valid || {
     printf '%s\n' 'fm-herdr-linear-check: only the persistent buildboard home may arm this check' >&2
     return 1
   }
-  for key in FM_LINEAR_READONLY_API_KEY FM_LINEAR_OPERATING_STUDIO_TEAM_ID FM_LINEAR_OPERATING_STUDIO_PROJECT_ID; do
-    [ -n "$(fmx_env_get "$key" "$ENV_FILE")" ] || {
-      printf 'fm-herdr-linear-check: %s is required in %s\n' "$key" "$ENV_FILE" >&2
-      return 1
-    }
-  done
+  primary_data=$(primary_data_dir) || {
+    printf '%s\n' 'fm-herdr-linear-check: buildboard needs a valid local parent binding to the primary Zeus registry' >&2
+    return 1
+  }
+  if ! secondmate_registry_validate_bindings \
+    "$primary_data/secondmates.md" secondmate_registry_path_key zeus; then
+    printf 'fm-herdr-linear-check: primary Zeus route is unavailable: %s\n' "$SECONDMATE_REGISTRY_ERROR" >&2
+    return 1
+  fi
+  load_linear_config || {
+    printf 'fm-herdr-linear-check: buildboard Linear configuration is incomplete in %s\n' "$ENV_FILE" >&2
+    return 1
+  }
   home=$(CDPATH='' cd -- "$FM_HOME" 2>/dev/null && pwd -P) || return 1
   [ -d "$STATE" ] && [ ! -L "$STATE" ] || return 1
   want=$(shim_content "$home")
@@ -176,9 +236,9 @@ action_arm() {
     || ! fm_pr_private_file_valid "$tmp" 700 "$device" \
     || ! fm_pr_regular_destination_on_device_or_absent "$CHECK_SHIM" "$device" \
     || ! mv -f -- "$tmp" "$CHECK_SHIM" \
-    || ! FM_HOME="$home" "$SCRIPT_DIR/fm-check-register.sh" "$CHECK_ID" >/dev/null; then
+    || ! FM_HOME="$home" FM_STATE_OVERRIDE="$STATE" "$SCRIPT_DIR/fm-check-register.sh" "$CHECK_ID" >/dev/null; then
     rm -f -- "$tmp"
-    FM_HOME="$home" "$SCRIPT_DIR/fm-check-unregister.sh" "$CHECK_ID" >/dev/null 2>&1 || true
+    FM_HOME="$home" FM_STATE_OVERRIDE="$STATE" "$SCRIPT_DIR/fm-check-unregister.sh" "$CHECK_ID" >/dev/null 2>&1 || true
     printf 'fm-herdr-linear-check: could not arm state/%s.check.sh\n' "$CHECK_ID" >&2
     return 1
   fi
@@ -186,7 +246,7 @@ action_arm() {
 }
 
 action_retire() {
-  "$SCRIPT_DIR/fm-check-unregister.sh" "$CHECK_ID" >/dev/null || return 1
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$SCRIPT_DIR/fm-check-unregister.sh" "$CHECK_ID" >/dev/null || return 1
   rm -f -- "$RECORD"
   printf 'retired: state/%s.check.sh\n' "$CHECK_ID"
 }
