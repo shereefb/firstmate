@@ -15,54 +15,65 @@ make_case() { # <name>
   mkdir -p "$dir/home/state" "$dir/home/data" "$dir/bin"
   cat > "$dir/bin/herdr" <<'SH'
 #!/usr/bin/env bash
-herdr_rows() {
-  local meta task backend session pane
-  for meta in "$FM_HOME"/state/*.meta; do
-    [ -f "$meta" ] || continue
-    backend=$(sed -n 's/^backend=//p' "$meta" | head -1)
-    [ "$backend" = herdr ] || continue
-    session=$(sed -n 's/^herdr_session=//p' "$meta" | head -1)
-    pane=$(sed -n 's/^herdr_pane_id=//p' "$meta" | head -1)
-    [ -n "$session" ] && [ -n "$pane" ] || continue
-    task=${meta##*/}; task=${task%.meta}
-    printf '%s\t%s\t%s\n' "$session" "$task" "$pane"
-  done
-  [ "${FM_TEST_HERDR_DISCOVERY:-empty}" = live ] \
-    && printf '%s\t%s\t%s\n' jarvis unrecorded p-unrecorded
-}
+mode=${FM_TEST_HERDR_DISCOVERY:-empty}
+workspace=
+previous=
+for arg in "$@"; do
+  if [ "$previous" = --workspace ]; then
+    workspace=$arg
+  fi
+  previous=$arg
+done
 case "${1:-} ${2:-}" in
   'session list')
-    case "${FM_TEST_HERDR_DISCOVERY:-empty}" in
+    case "$mode" in
       fail) exit 1 ;;
-      *) herdr_rows | jq -Rn '
-        [inputs | split("\t") | .[0]] | unique
-        | {sessions:map({name:.,running:true})}' ;;
+      inherited) printf '%s\n' '{"sessions":[{"name":"jarvis","running":true,"socket_path":"/tmp/herdr-jarvis.sock"}]}' ;;
+      *) printf '%s\n' '{"sessions":[]}' ;;
     esac
     ;;
   'workspace list')
-    printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-home","label":"firstmate"}]}}'
+    case "$mode" in
+      fail) exit 1 ;;
+      inherited) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-foreign","label":"firstmate"},{"workspace_id":"w-owned","label":"firstmate"}]}}' ;;
+      projection) jq -cn --arg token "$FM_TEST_PROJECTION_TOKEN" '{result:{workspaces:[
+        {workspace_id:"w-parent",label:"firstmate"},
+        {workspace_id:"w-projected",label:("└ projected · p:" + $token)}]}}' ;;
+      *) printf '%s\n' '{"result":{"workspaces":[]}}' ;;
+    esac
     ;;
   'tab list')
-    herdr_rows | jq -Rn '
-      [inputs | split("\t") | select(.[0] == "jarvis")
-       | {tab_id:("t-" + .[1]),label:("fm-" + .[1])}]
-      | {result:{tabs:.}}'
+    case "$mode:$workspace" in
+      inherited:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"buildboard"},{"tab_id":"t-unrecorded","label":"fm-unrecorded"}]}}' ;;
+      inherited:w-foreign) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-foreign","label":"fm-foreign"}]}}' ;;
+      projection:w-projected) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-projected","label":"fm-projected"}]}}' ;;
+      *) printf '%s\n' '{"result":{"tabs":[]}}' ;;
+    esac
     ;;
   'pane list')
-    herdr_rows | jq -Rn '
-      [inputs | split("\t") | select(.[0] == "jarvis")
-       | {pane_id:.[2],tab_id:("t-" + .[1])}]
-      | {result:{panes:.}}'
+    case "$mode:$workspace" in
+      inherited:w-owned) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-launch"},{"pane_id":"p-unrecorded","tab_id":"t-unrecorded"}]}}' ;;
+      inherited:w-foreign) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-foreign","tab_id":"t-foreign"}]}}' ;;
+      projection:w-projected) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-projected","tab_id":"t-projected"}]}}' ;;
+      *) printf '%s\n' '{"result":{"panes":[]}}' ;;
+    esac
     ;;
   'pane get')
     case "${3:-}" in
       p-missing) printf '%s\n' '{"error":{"code":"pane_not_found"}}' ;;
+      p-launch) printf '%s\n' '{"result":{"pane":{"pane_id":"p-launch","tab_id":"t-launch","workspace_id":"w-owned"}}}' ;;
       *) printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "${3:-}" ;;
+    esac
+    ;;
+  'tab get')
+    case "${3:-}" in
+      t-launch) printf '%s\n' '{"result":{"tab":{"tab_id":"t-launch","workspace_id":"w-owned"}}}' ;;
+      *) printf '%s\n' '{"error":{"code":"tab_not_found"}}' ;;
     esac
     ;;
   'agent get')
     case "${3:-}" in
-      p-working|p-review|p-shared|p-stale|p-unrecorded) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
+      p-working|p-review|p-shared|p-stale|p-unrecorded|p-foreign|p-projected) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
       p-idle) printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}' ;;
       *) printf '%s\n' '{"error":{"code":"agent_not_found"}}' ;;
     esac
@@ -167,9 +178,31 @@ write_nonherdr_meta() { # <home> <task> <endpoint> <card-id>
   } > "$home/state/$task.meta"
 }
 
+write_projection_journal() { # <home> <task> <token>
+  local home=$1 task=$2 token=$3 canonical
+  canonical=$(CDPATH='' cd -- "$home" && pwd -P) || return 1
+  cat > "$home/state/$task.herdr-presentation" <<EOF
+version=2
+task_id=$task
+projection_id=$token
+home=$canonical
+session=jarvis
+workspace_id=w-projected
+tab_id=t-projected
+pane_id=p-projected
+parent_workspace_id=w-parent
+parent_label=firstmate
+workspace_label=└ projected · p:$token
+task_label=fm-$task
+EOF
+}
+
 run_reconcile() { # <case-dir> <cards>
   local dir=$1 cards=$2
   PATH="$dir/bin:$PATH" FM_HERDR_PS_BIN="$dir/bin/fake-ps" FM_HOME="$dir/home" \
+    HERDR_PANE_ID="${FM_TEST_LAUNCHER_PANE_ID:-}" \
+    HERDR_SESSION="${FM_TEST_LAUNCHER_SESSION:-}" \
+    HERDR_SOCKET_PATH="${FM_TEST_LAUNCHER_SOCKET:-}" \
     FM_SSH_BIN="$dir/bin/fake-ssh" FM_TEST_ZEUS_LIVE_INVENTORY="$dir/zeus-live.json" \
     FM_TEST_ZEUS_SSH_COUNT="$dir/zeus-ssh.count" \
     FM_TEST_LINEAR_CARDS_FILE="$cards" LINEAR_API_KEY=secret \
@@ -213,13 +246,15 @@ JSON
   pass "comparison obtains fresh Zeus inventory through its registered route"
 }
 
-test_unrecorded_live_worker_is_discovered() {
-  local dir cards out rc
-  dir=$(make_case discovered-worker)
+test_exact_live_worker_ownership_is_discovered() {
+  local dir cards out rc token
+  dir=$(make_case inherited-worker)
   cards="$dir/cards.json"
   printf '%s\n' '{"cards":[]}' > "$cards"
-  out=$(FM_TEST_HERDR_DISCOVERY=live run_reconcile "$dir" "$cards") \
-    || fail "unrecorded live worker discovery failed"
+  out=$(FM_TEST_HERDR_DISCOVERY=inherited FM_TEST_LAUNCHER_PANE_ID=p-launch \
+    FM_TEST_LAUNCHER_SESSION=jarvis FM_TEST_LAUNCHER_SOCKET=/tmp/herdr-jarvis.sock \
+    run_reconcile "$dir" "$cards") \
+    || fail "inherited live worker discovery failed"
   printf '%s' "$out" | jq -e '
     .summary.workers == 1
     and .summary.needs_deep_check == 1
@@ -228,15 +263,44 @@ test_unrecorded_live_worker_is_discovered() {
       endpoint:"jarvis:p-unrecorded", herdr_session:"jarvis",
       herdr_pane_id:"p-unrecorded", endpoint_status:"alive"}]
     and .findings[0].kind == "worker-without-applicable-card"
-  ' >/dev/null || fail "unrecorded live worker was omitted from reconciliation: $out"
+    and ([.local_inventory.children[] | select(.task_id == "foreign")] | length) == 0
+  ' >/dev/null || fail "exact inherited workspace ownership was not enforced: $out"
 
-  out=$(FM_TEST_HERDR_DISCOVERY=fail run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
+  dir=$(make_case projected-worker)
+  cards="$dir/cards.json"
+  token=abcdefghijklmnopqrstuv
+  printf '%s\n' '{"cards":[]}' > "$cards"
+  write_projection_journal "$dir/home" projected "$token" \
+    || fail "could not create projection binding fixture"
+  out=$(FM_TEST_HERDR_DISCOVERY=projection FM_TEST_PROJECTION_TOKEN="$token" \
+    run_reconcile "$dir" "$cards") || fail "projected live worker discovery failed"
+  printf '%s' "$out" | jq -e '
+    .summary.workers == 1
+    and .local_inventory.children[0].task_id == "projected"
+    and .local_inventory.children[0].endpoint == "jarvis:p-projected"
+    and .local_inventory.children[0].endpoint_status == "alive"
+  ' >/dev/null || fail "exact projected worker binding was not counted: $out"
+  write_meta "$dir/home" projected p-projected ''
+  out=$(FM_TEST_HERDR_DISCOVERY=projection FM_TEST_PROJECTION_TOKEN="$token" \
+    run_reconcile "$dir" "$cards") || fail "recorded projected worker reconciliation failed"
+  printf '%s' "$out" | jq -e '
+    .summary.workers == 1
+    and (.local_inventory.children | length) == 1
+    and .local_inventory.children[0].endpoint_status == "alive"
+  ' >/dev/null || fail "recorded projected worker was downgraded: $out"
+
+  dir=$(make_case unavailable-worker-ownership)
+  cards="$dir/cards.json"
+  printf '%s\n' '{"cards":[]}' > "$cards"
+  out=$(FM_TEST_HERDR_DISCOVERY=fail FM_TEST_LAUNCHER_PANE_ID=p-launch \
+    FM_TEST_LAUNCHER_SESSION=jarvis FM_TEST_LAUNCHER_SOCKET=/tmp/herdr-jarvis.sock \
+    run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "unavailable Herdr population was treated as empty"
   case "$out" in
-    *'could not enumerate running Herdr sessions'*) ;;
+    *'could not verify the inherited Herdr workspace'*) ;;
     *) fail "unavailable Herdr population diagnostic drifted: $out" ;;
   esac
-  pass "inventory discovers unrecorded live workers and fails closed when unavailable"
+  pass "inventory uses exact inherited and projected ownership bindings"
 }
 
 test_local_registered_inventory_route_is_accepted() {
@@ -456,7 +520,7 @@ test_required_inputs_fail_clearly() {
 
 test_equal_count_wrong_identity
 test_remote_inventory_is_fetched_live
-test_unrecorded_live_worker_is_discovered
+test_exact_live_worker_ownership_is_discovered
 test_local_registered_inventory_route_is_accepted
 test_duplicate_ownership_and_endpoint_identity
 test_unrelated_worker_and_missing_endpoint
