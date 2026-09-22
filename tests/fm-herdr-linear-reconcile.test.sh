@@ -15,7 +15,45 @@ make_case() { # <name>
   mkdir -p "$dir/home/state" "$dir/home/data" "$dir/bin"
   cat > "$dir/bin/herdr" <<'SH'
 #!/usr/bin/env bash
+herdr_rows() {
+  local meta task backend session pane
+  for meta in "$FM_HOME"/state/*.meta; do
+    [ -f "$meta" ] || continue
+    backend=$(sed -n 's/^backend=//p' "$meta" | head -1)
+    [ "$backend" = herdr ] || continue
+    session=$(sed -n 's/^herdr_session=//p' "$meta" | head -1)
+    pane=$(sed -n 's/^herdr_pane_id=//p' "$meta" | head -1)
+    [ -n "$session" ] && [ -n "$pane" ] || continue
+    task=${meta##*/}; task=${task%.meta}
+    printf '%s\t%s\t%s\n' "$session" "$task" "$pane"
+  done
+  [ "${FM_TEST_HERDR_DISCOVERY:-empty}" = live ] \
+    && printf '%s\t%s\t%s\n' jarvis unrecorded p-unrecorded
+}
 case "${1:-} ${2:-}" in
+  'session list')
+    case "${FM_TEST_HERDR_DISCOVERY:-empty}" in
+      fail) exit 1 ;;
+      *) herdr_rows | jq -Rn '
+        [inputs | split("\t") | .[0]] | unique
+        | {sessions:map({name:.,running:true})}' ;;
+    esac
+    ;;
+  'workspace list')
+    printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-home","label":"firstmate"}]}}'
+    ;;
+  'tab list')
+    herdr_rows | jq -Rn '
+      [inputs | split("\t") | select(.[0] == "jarvis")
+       | {tab_id:("t-" + .[1]),label:("fm-" + .[1])}]
+      | {result:{tabs:.}}'
+    ;;
+  'pane list')
+    herdr_rows | jq -Rn '
+      [inputs | split("\t") | select(.[0] == "jarvis")
+       | {pane_id:.[2],tab_id:("t-" + .[1])}]
+      | {result:{panes:.}}'
+    ;;
   'pane get')
     case "${3:-}" in
       p-missing) printf '%s\n' '{"error":{"code":"pane_not_found"}}' ;;
@@ -24,7 +62,7 @@ case "${1:-} ${2:-}" in
     ;;
   'agent get')
     case "${3:-}" in
-      p-working|p-review|p-shared|p-stale) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
+      p-working|p-review|p-shared|p-stale|p-unrecorded) printf '%s\n' '{"result":{"agent":{"agent_status":"working"}}}' ;;
       p-idle) printf '%s\n' '{"result":{"agent":{"agent_status":"idle"}}}' ;;
       *) printf '%s\n' '{"error":{"code":"agent_not_found"}}' ;;
     esac
@@ -173,6 +211,32 @@ JSON
   ' >/dev/null || fail "a retained Zeus snapshot was reused: $refreshed"
   [ "$(cat "$dir/zeus-ssh.count")" -eq 2 ] || fail "Zeus route was not read on every comparison"
   pass "comparison obtains fresh Zeus inventory through its registered route"
+}
+
+test_unrecorded_live_worker_is_discovered() {
+  local dir cards out rc
+  dir=$(make_case discovered-worker)
+  cards="$dir/cards.json"
+  printf '%s\n' '{"cards":[]}' > "$cards"
+  out=$(FM_TEST_HERDR_DISCOVERY=live run_reconcile "$dir" "$cards") \
+    || fail "unrecorded live worker discovery failed"
+  printf '%s' "$out" | jq -e '
+    .summary.workers == 1
+    and .summary.needs_deep_check == 1
+    and .local_inventory.children == [{
+      task_id:"unrecorded", linear_card_id:"", backend:"herdr",
+      endpoint:"jarvis:p-unrecorded", herdr_session:"jarvis",
+      herdr_pane_id:"p-unrecorded", endpoint_status:"alive"}]
+    and .findings[0].kind == "worker-without-applicable-card"
+  ' >/dev/null || fail "unrecorded live worker was omitted from reconciliation: $out"
+
+  out=$(FM_TEST_HERDR_DISCOVERY=fail run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "unavailable Herdr population was treated as empty"
+  case "$out" in
+    *'could not enumerate running Herdr sessions'*) ;;
+    *) fail "unavailable Herdr population diagnostic drifted: $out" ;;
+  esac
+  pass "inventory discovers unrecorded live workers and fails closed when unavailable"
 }
 
 test_local_registered_inventory_route_is_accepted() {
@@ -392,6 +456,7 @@ test_required_inputs_fail_clearly() {
 
 test_equal_count_wrong_identity
 test_remote_inventory_is_fetched_live
+test_unrecorded_live_worker_is_discovered
 test_local_registered_inventory_route_is_accepted
 test_duplicate_ownership_and_endpoint_identity
 test_unrelated_worker_and_missing_endpoint

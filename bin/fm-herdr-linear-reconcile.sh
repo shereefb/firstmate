@@ -5,10 +5,10 @@
 #   fm-herdr-linear-reconcile.sh --inventory
 #   fm-herdr-linear-reconcile.sh --linear-api
 #
-# `--inventory` is run by each owning home. It reads only that home's direct
-# child metadata and asks Herdr for each recorded endpoint. A parent receives a
-# fresh secondmate inventory through its registered route; it never enumerates
-# the secondmate's panes itself.
+# `--inventory` is run by each owning home. It enumerates live Firstmate task
+# panes in that home's Herdr workspaces and joins them to direct child metadata.
+# A parent receives a fresh secondmate inventory through its registered route;
+# it never enumerates the secondmate's panes itself.
 # The comparison joins a Linear issue's immutable `id` to `linear_card_id=` in
 # task metadata, and endpoint identity to the task's recorded Herdr ids. It
 # deliberately does not inspect pane text, fm-crew-state, validation, or PRs.
@@ -94,11 +94,101 @@ safe_field() { # metadata values become TSV fields
   case "$1" in *$'\t'*|*$'\n'*|*$'\r'*) return 1 ;; esac
 }
 
-# local_inventory writes a compact, home-owned inventory. The only live lookup
-# is the shared process-backed classifier for each recorded Herdr endpoint, not
-# a global pane list or a title/order heuristic.
+task_id_valid() {
+  case "$1" in ''|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ "${#1}" -le 64 ]
+}
+
+discover_live_workers() { # <rows>
+  local rows=$1 sessions session label workspaces wsids ws_count wsid tabs panes
+  local pane task_id endpoint status
+  : > "$rows"
+  sessions="$TMP/herdr-sessions.json"
+  if ! herdr session list --json > "$sessions" 2>/dev/null \
+    || ! jq -e '(.sessions | type) == "array" and all(.sessions[]?;
+      (.name | type) == "string" and (.name | length) > 0 and (.running | type) == "boolean")
+      and ([.sessions[] | select(.running == true) | .name] | unique | length)
+        == ([.sessions[] | select(.running == true)] | length)' \
+      "$sessions" >/dev/null 2>&1; then
+    echo 'fm-herdr-linear-reconcile: could not enumerate running Herdr sessions' >&2
+    return 1
+  fi
+  while IFS= read -r session; do
+    [ -n "$session" ] || continue
+    safe_field "$session" || {
+      echo 'fm-herdr-linear-reconcile: Herdr returned an unsafe session identity' >&2
+      return 1
+    }
+    workspaces="$TMP/herdr-workspaces.json"
+    if ! fm_backend_herdr_cli "$session" workspace list > "$workspaces" 2>/dev/null \
+      || ! jq -e '(.result.workspaces | type) == "array" and all(.result.workspaces[]?;
+        (.workspace_id | type) == "string" and (.workspace_id | length) > 0
+        and (.label | type) == "string")' "$workspaces" >/dev/null 2>&1; then
+      echo "fm-herdr-linear-reconcile: could not enumerate Herdr workspaces in session $session" >&2
+      return 1
+    fi
+    label=$(fm_backend_herdr_workspace_label)
+    wsids=$(jq -r --arg want "$label" \
+      '.result.workspaces[] | select(.label == $want) | .workspace_id' "$workspaces")
+    ws_count=$(printf '%s\n' "$wsids" | awk 'NF { n += 1 } END { print n + 0 }')
+    [ "$ws_count" -le 1 ] || {
+      echo "fm-herdr-linear-reconcile: Herdr home workspace is ambiguous in session $session" >&2
+      return 1
+    }
+    [ "$ws_count" -eq 1 ] || continue
+    wsid=$wsids
+    tabs="$TMP/herdr-tabs.json"
+    panes="$TMP/herdr-panes.json"
+    if ! fm_backend_herdr_cli "$session" tab list --workspace "$wsid" > "$tabs" 2>/dev/null \
+      || ! jq -e '(.result.tabs | type) == "array" and all(.result.tabs[]?;
+        (.tab_id | type) == "string" and (.tab_id | length) > 0
+        and (.label | type) == "string")' "$tabs" >/dev/null 2>&1 \
+      || ! fm_backend_herdr_cli "$session" pane list --workspace "$wsid" > "$panes" 2>/dev/null \
+      || ! jq -e '(.result.panes | type) == "array" and all(.result.panes[]?;
+        (.pane_id | type) == "string" and (.pane_id | length) > 0
+        and (.tab_id | type) == "string" and (.tab_id | length) > 0)' "$panes" >/dev/null 2>&1; then
+      echo "fm-herdr-linear-reconcile: could not enumerate Herdr task panes in session $session" >&2
+      return 1
+    fi
+    while IFS=$'\t' read -r pane task_id; do
+      [ -n "$pane" ] || continue
+      task_id_valid "$task_id" || {
+        echo "fm-herdr-linear-reconcile: Herdr returned an invalid Firstmate task identity in session $session" >&2
+        return 1
+      }
+      endpoint="$session:$pane"
+      status=$(fm_backend_agent_state herdr "$endpoint")
+      case "$status" in
+        alive)
+          for value in "$task_id" "$endpoint" "$session" "$pane"; do
+            safe_field "$value" || {
+              echo "fm-herdr-linear-reconcile: unsafe live Herdr worker identity for task $task_id" >&2
+              return 1
+            }
+          done
+          printf '%s\t\therdr\t%s\t%s\t%s\talive\n' \
+            "$task_id" "$endpoint" "$session" "$pane" >> "$rows"
+          ;;
+        dead|missing) ;;
+        *)
+          echo "fm-herdr-linear-reconcile: could not verify Herdr worker $endpoint" >&2
+          return 1
+          ;;
+      esac
+    done < <(jq -r --slurpfile panes "$panes" '
+      .result.tabs[]
+      | select(.label | startswith("fm-") and length > 3) as $tab
+      | $panes[0].result.panes[]
+      | select(.tab_id == $tab.tab_id)
+      | [.pane_id, $tab.label[3:]]
+      | @tsv
+    ' "$tabs")
+  done < <(jq -r '.sessions[] | select(.running == true) | .name' "$sessions")
+}
+
 local_inventory() {
-  local rows="$TMP/local.rows" meta id kind backend endpoint card session pane status
+  local rows="$TMP/local.rows" live_rows="$TMP/local-live.rows"
+  local meta id kind backend endpoint card session pane status value
   : > "$rows"
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] && [ ! -L "$meta" ] || continue
@@ -128,15 +218,37 @@ local_inventory() {
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$id" "$card" "$backend" "$endpoint" "$session" "$pane" "$status" >> "$rows"
   done
-  jq -Rn --arg home "$FM_HOME" '
+  discover_live_workers "$live_rows" || return 1
+  jq -Rn '
     [inputs
      | split("\t")
      | select(length == 7)
      | {task_id:.[0], linear_card_id:.[1], backend:.[2], endpoint:.[3],
         herdr_session:.[4], herdr_pane_id:.[5], endpoint_status:.[6]}]
-    | sort_by(.task_id)
+  ' < "$rows" > "$TMP/local-records.json"
+  jq -Rn '
+    [inputs
+     | split("\t")
+     | select(length == 7)
+     | {task_id:.[0], linear_card_id:.[1], backend:.[2], endpoint:.[3],
+        herdr_session:.[4], herdr_pane_id:.[5], endpoint_status:.[6]}]
+  ' < "$live_rows" > "$TMP/local-live.json"
+  jq -n --arg home "$FM_HOME" \
+    --slurpfile records "$TMP/local-records.json" --slurpfile live "$TMP/local-live.json" '
+    ($records[0] | map(. as $record
+      | if $record.backend == "herdr"
+        and any($live[0][]; .task_id == $record.task_id and .endpoint == $record.endpoint)
+        then .endpoint_status = "alive"
+        elif $record.backend == "herdr" and $record.endpoint_status == "alive"
+        then .endpoint_status = "unverified"
+        else . end)) as $joined
+    | ($joined + [ $live[0][] as $worker
+        | select(any($records[0][];
+            .task_id == $worker.task_id and .backend == "herdr" and .endpoint == $worker.endpoint) | not)
+        | $worker ])
+    | sort_by(.task_id, .backend, .endpoint)
     | {schema:"fm-herdr-linear-inventory.v1", home:$home, children:.}
-  ' < "$rows"
+  '
 }
 
 LOCAL=$(local_inventory) || exit $?

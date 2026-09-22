@@ -230,6 +230,7 @@ The command always emits one JSON object that names exact identity, verified-liv
 The persistent `buildboard` secondmate is the sole automatic owner.
 Put its read-only Linear credential and the two Operating Studio identities in that home's gitignored `.env`, then run `bin/fm-herdr-linear-check.sh arm` from that local secondmate home.
 The check reads those three values fresh from `.env`, resolves the primary from buildboard's durable parent binding, and uses only the primary's registered Zeus route for each fresh inventory.
+Each inventory enumerates live Firstmate task panes in the owning home's Herdr workspaces across all running sessions, then joins those workers to task metadata.
 The command idempotently installs one hash-bound custom check on the existing watcher, gates reconciliation to one run every 15 minutes, and applies an internal deadline three seconds below the watcher timeout.
 It stays silent when every identity and count matches, and emits one actionable line when deeper inspection is needed, reconciliation fails, or cadence state cannot be saved.
 Run `bin/fm-herdr-linear-check.sh retire` to remove the shim, trust binding, and cadence record idempotently.
