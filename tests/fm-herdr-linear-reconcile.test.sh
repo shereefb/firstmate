@@ -50,6 +50,8 @@ case "$*" in
 esac
 SH
   chmod +x "$dir/bin/herdr" "$dir/bin/fake-ps"
+  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"zeus-home","children":[]}' > "$dir/zeus.json"
+  write_linear_curl "$dir"
   printf '%s\n' "$dir"
 }
 
@@ -57,6 +59,7 @@ write_linear_curl() { # <case-dir>
   local dir=$1
   cat > "$dir/bin/curl" <<'SH'
 #!/usr/bin/env bash
+cards_file=${FM_TEST_LINEAR_CARDS_FILE:?}
 payload=
 while [ "$#" -gt 0 ]; do
   if [ "$1" = --data ]; then
@@ -71,11 +74,15 @@ printf '%s' "$payload" | jq -e '
   and (.query | contains("project: { id: { eq: $project } }"))
 ' >/dev/null || exit 22
 after=$(printf '%s' "$payload" | jq -r '.variables.after // ""')
-case "$after" in
-  '') printf '%s\n' '{"data":{"issues":{"nodes":[{"id":"card-api-1","identifier":"OS-101","state":{"name":"In Progress"}}],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-1"}}}}' ;;
-  cursor-1) printf '%s\n' '{"data":{"issues":{"nodes":[{"id":"card-api-2","identifier":"OS-102","state":{"name":"In Review"}}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}' ;;
-  *) exit 22 ;;
-esac
+if [ "${FM_TEST_LINEAR_PAGINATED:-0}" = 1 ]; then
+  case "$after" in
+    '') jq -c '{data:{issues:{nodes:(.cards[0:1] | map(.state = {name:.state})),pageInfo:{hasNextPage:true,endCursor:"cursor-1"}}}}' "$cards_file" ;;
+    cursor-1) jq -c '{data:{issues:{nodes:(.cards[1:] | map(.state = {name:.state})),pageInfo:{hasNextPage:false,endCursor:null}}}}' "$cards_file" ;;
+    *) exit 22 ;;
+  esac
+else
+  jq -c '{data:{issues:{nodes:(.cards | map(.state = {name:.state})),pageInfo:{hasNextPage:false,endCursor:null}}}}' "$cards_file"
+fi
 SH
   chmod +x "$dir/bin/curl"
 }
@@ -94,11 +101,12 @@ write_meta() { # <home> <task> <pane> <card-id> [<pr>]
 
 run_reconcile() { # <case-dir> <cards> [<zeus-inventory>]
   local dir=$1 cards=$2 zeus=${3:-}
-  if [ -n "$zeus" ]; then
-    PATH="$dir/bin:$PATH" FM_HERDR_PS_BIN="$dir/bin/fake-ps" FM_HOME="$dir/home" "$SCRIPT" --cards "$cards" --zeus-inventory "$zeus" --json
-  else
-    PATH="$dir/bin:$PATH" FM_HERDR_PS_BIN="$dir/bin/fake-ps" FM_HOME="$dir/home" "$SCRIPT" --cards "$cards" --json
-  fi
+  [ -n "$zeus" ] || zeus="$dir/zeus.json"
+  PATH="$dir/bin:$PATH" FM_HERDR_PS_BIN="$dir/bin/fake-ps" FM_HOME="$dir/home" \
+    FM_TEST_LINEAR_CARDS_FILE="$cards" LINEAR_API_KEY=secret \
+    FM_LINEAR_OPERATING_STUDIO_TEAM_ID=team-os \
+    FM_LINEAR_OPERATING_STUDIO_PROJECT_ID=project-os \
+    "$SCRIPT" --linear-api --zeus-inventory "$zeus" --json
 }
 
 test_equal_count_wrong_identity() {
@@ -158,7 +166,7 @@ test_empty_card_identities_are_rejected() {
     fi
     out=$(run_reconcile "$dir" "$cards" 2>&1) && rc=0 || rc=$?
     [ "$rc" -ne 0 ] || fail "empty $field was accepted"
-    case "$out" in *'Linear input is invalid'*) ;; *) fail "empty $field diagnostic drifted: $out" ;; esac
+    case "$out" in *'Linear API returned invalid cards'*) ;; *) fail "empty $field diagnostic drifted: $out" ;; esac
   done
   pass "empty Linear card identities are rejected before reconciliation"
 }
@@ -181,20 +189,24 @@ test_remote_inventory_requires_complete_schema() {
 }
 
 test_linear_api_requires_project_and_reads_all_pages() {
-  local dir out rc
+  local dir cards out rc
   dir=$(make_case linear-api)
-  write_linear_curl "$dir"
+  cards="$dir/cards.json"
+  printf '%s\n' '{"cards":[{"id":"card-api-1","identifier":"OS-101","state":"In Progress"},{"id":"card-api-2","identifier":"OS-102","state":"In Review"}]}' > "$cards"
   out=$(env -u FM_LINEAR_OPERATING_STUDIO_PROJECT_ID \
     PATH="$dir/bin:$PATH" FM_HERDR_PS_BIN="$dir/bin/fake-ps" FM_HOME="$dir/home" \
-    LINEAR_API_KEY=secret FM_LINEAR_OPERATING_STUDIO_TEAM_ID=team-os \
-    "$SCRIPT" --linear-api --json 2>&1) && rc=0 || rc=$?
+    FM_TEST_LINEAR_CARDS_FILE="$cards" LINEAR_API_KEY=secret \
+    FM_LINEAR_OPERATING_STUDIO_TEAM_ID=team-os \
+    "$SCRIPT" --linear-api --zeus-inventory "$dir/zeus.json" --json 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "Linear API ran without an Operating Studio project id"
   case "$out" in *'FM_LINEAR_OPERATING_STUDIO_PROJECT_ID is required'*) ;; *) fail "missing project diagnostic drifted: $out" ;; esac
 
   out=$(PATH="$dir/bin:$PATH" FM_HERDR_PS_BIN="$dir/bin/fake-ps" FM_HOME="$dir/home" \
+    FM_TEST_LINEAR_CARDS_FILE="$cards" FM_TEST_LINEAR_PAGINATED=1 \
     LINEAR_API_KEY=secret FM_LINEAR_OPERATING_STUDIO_TEAM_ID=team-os \
     FM_LINEAR_OPERATING_STUDIO_PROJECT_ID=project-os \
-    "$SCRIPT" --linear-api --json) || fail "paginated Linear API reconciliation failed"
+    "$SCRIPT" --linear-api --zeus-inventory "$dir/zeus.json" --json) \
+    || fail "paginated Linear API reconciliation failed"
   printf '%s' "$out" | jq -e '
     .summary.cards == 2
     and ([.cards[].id] | sort) == ["card-api-1", "card-api-2"]
@@ -253,18 +265,27 @@ test_non_applicable_columns_do_not_cover_workers() {
   pass "only In Progress and In Review cards provide coverage"
 }
 
-test_unavailable_inputs_fail_clearly() {
+test_required_inputs_fail_clearly() {
   local dir cards out rc
   dir=$(make_case unavailable)
   cards="$dir/cards.json"
   printf '%s\n' '{"cards":[]}' > "$cards"
-  out=$(PATH="/usr/bin:/bin" FM_HOME="$dir/home" "$SCRIPT" --cards "$cards" --json 2>&1) && rc=0 || rc=$?
+  out=$(PATH="/usr/bin:/bin" FM_HOME="$dir/home" "$SCRIPT" --linear-api --zeus-inventory "$dir/zeus.json" --json 2>&1) && rc=0 || rc=$?
   [ "$rc" -ne 0 ] || fail "missing Herdr succeeded"
   case "$out" in *'Herdr is unavailable'*) ;; *) fail "missing Herdr diagnostic was unclear: $out" ;; esac
-  out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --cards "$dir/no-such-cards.json" --json 2>&1) && rc=0 || rc=$?
-  [ "$rc" -ne 0 ] || fail "missing Linear input succeeded"
-  case "$out" in *'Linear input is unavailable'*) ;; *) fail "missing Linear diagnostic was unclear: $out" ;; esac
-  pass "unavailable Herdr and Linear input fail clearly"
+
+  out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --linear-api --json 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "comparison without Zeus inventory succeeded"
+  case "$out" in *'comparison requires --zeus-inventory'*) ;; *) fail "missing Zeus option diagnostic was unclear: $out" ;; esac
+
+  out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --linear-api --zeus-inventory "$dir/no-such-zeus.json" --json 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "comparison with unavailable Zeus inventory succeeded"
+  case "$out" in *'Zeus inventory is unavailable'*) ;; *) fail "unavailable Zeus diagnostic was unclear: $out" ;; esac
+
+  out=$(PATH="$dir/bin:$PATH" FM_HOME="$dir/home" "$SCRIPT" --cards "$cards" --zeus-inventory "$dir/zeus.json" --json 2>&1) && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "unscoped --cards input succeeded"
+  case "$out" in *'usage: fm-herdr-linear-reconcile.sh'*) ;; *) fail "removed --cards mode did not return usage: $out" ;; esac
+  pass "comparison requires Zeus inventory and rejects unscoped card input"
 }
 
 test_equal_count_wrong_identity
@@ -276,5 +297,5 @@ test_process_liveness_outranks_recorded_agent_status
 test_empty_card_identities_are_rejected
 test_remote_inventory_requires_complete_schema
 test_linear_api_requires_project_and_reads_all_pages
-test_unavailable_inputs_fail_clearly
+test_required_inputs_fail_clearly
 printf 'all fm-herdr-linear-reconcile tests passed\n'

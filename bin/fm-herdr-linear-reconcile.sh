@@ -3,8 +3,7 @@
 #
 # Usage:
 #   fm-herdr-linear-reconcile.sh --inventory --json
-#   fm-herdr-linear-reconcile.sh --cards <Linear-response.json> [--zeus-inventory <inventory.json>] [--json]
-#   fm-herdr-linear-reconcile.sh --linear-api [--zeus-inventory <inventory.json>] [--json]
+#   fm-herdr-linear-reconcile.sh --linear-api --zeus-inventory <inventory.json> [--json]
 #
 # `--inventory` is run by each owning home. It reads only that home's direct
 # child metadata and asks Herdr for each recorded endpoint. A parent receives a
@@ -14,9 +13,7 @@
 # deliberately does not inspect pane text, fm-crew-state, validation, or PRs.
 # Any case those deeper checks must settle is reported as needs-deep-check.
 #
-# `--cards` accepts either Linear's GraphQL response
-# `{data:{issues:{nodes:[...]}}}` or `{cards:[...]}` with id, identifier, and
-# state fields. `--linear-api` fetches the same source using LINEAR_API_KEY and
+# `--linear-api` fetches cards using LINEAR_API_KEY and
 # FM_LINEAR_OPERATING_STUDIO_TEAM_ID and
 # FM_LINEAR_OPERATING_STUDIO_PROJECT_ID. It never prints the API key.
 #
@@ -35,7 +32,6 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-backend.sh"
 
 MODE=compare
-CARDS_FILE=
 ZEUS_INVENTORY=
 JSON_ONLY=0
 LINEAR_API=0
@@ -43,8 +39,7 @@ LINEAR_API=0
 usage() {
   cat <<'EOF'
 usage: fm-herdr-linear-reconcile.sh --inventory --json
-       fm-herdr-linear-reconcile.sh --cards <Linear-response.json> [--zeus-inventory <inventory.json>] [--json]
-       fm-herdr-linear-reconcile.sh --linear-api [--zeus-inventory <inventory.json>] [--json]
+       fm-herdr-linear-reconcile.sh --linear-api --zeus-inventory <inventory.json> [--json]
 
 Read-only Herdr and Linear reconciliation for Operating Studio cards.
 EOF
@@ -53,11 +48,6 @@ EOF
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --inventory) MODE=inventory ;;
-    --cards)
-      shift
-      [ "$#" -gt 0 ] || { echo 'fm-herdr-linear-reconcile: --cards requires a file' >&2; exit 2; }
-      CARDS_FILE=$1
-      ;;
     --zeus-inventory)
       shift
       [ "$#" -gt 0 ] || { echo 'fm-herdr-linear-reconcile: --zeus-inventory requires a file' >&2; exit 2; }
@@ -72,17 +62,17 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$MODE" = inventory ] || {
-  [ -n "$CARDS_FILE" ] || [ "$LINEAR_API" = 1 ] || {
-    echo 'fm-herdr-linear-reconcile: choose --cards or --linear-api' >&2
+  [ "$LINEAR_API" = 1 ] || {
+    echo 'fm-herdr-linear-reconcile: comparison requires --linear-api' >&2
     exit 2
   }
-  [ -z "$CARDS_FILE" ] || [ "$LINEAR_API" = 0 ] || {
-    echo 'fm-herdr-linear-reconcile: --cards and --linear-api are mutually exclusive' >&2
+  [ -n "$ZEUS_INVENTORY" ] || {
+    echo 'fm-herdr-linear-reconcile: comparison requires --zeus-inventory <file>' >&2
     exit 2
   }
 }
 [ "$MODE" = compare ] || {
-  [ -z "$ZEUS_INVENTORY" ] && [ "$LINEAR_API" = 0 ] && [ -z "$CARDS_FILE" ] || {
+  [ -z "$ZEUS_INVENTORY" ] && [ "$LINEAR_API" = 0 ] || {
     echo 'fm-herdr-linear-reconcile: --inventory accepts only --json' >&2
     exit 2
   }
@@ -170,33 +160,32 @@ if [ "$MODE" = inventory ]; then
   exit 0
 fi
 
-load_cards() {
-  local raw=$1
-  [ -f "$raw" ] && [ ! -L "$raw" ] || {
-    echo "fm-herdr-linear-reconcile: Linear input is unavailable at $raw" >&2
-    return 1
-  }
-  jq -e '
-    if (.cards | type) == "array" then .cards
-    elif (.data.issues.nodes | type) == "array" then .data.issues.nodes
-    else error("expected cards[] or data.issues.nodes[]") end
-    | map({id:(.id // ""), identifier:(.identifier // ""),
-           state:(if (.state | type) == "object" then (.state.name // "") else (.state // "") end)})
-    | if all(.[];
-        ((.id | type) == "string" and (.id | length) > 0)
-        and ((.identifier | type) == "string" and (.identifier | length) > 0)
-        and (.state | type) == "string")
-      then . else error("a card is missing id, identifier, or state") end
-    | map(select(.state == "In Progress" or .state == "In Review"))
-    | sort_by(.id, .identifier)
-  ' "$raw" > "$TMP/cards.json" || {
-    echo 'fm-herdr-linear-reconcile: Linear input is invalid' >&2
-    return 1
-  }
+[ -f "$ZEUS_INVENTORY" ] && [ ! -L "$ZEUS_INVENTORY" ] || {
+  echo "fm-herdr-linear-reconcile: Zeus inventory is unavailable at $ZEUS_INVENTORY" >&2
+  exit 1
 }
+jq -e '
+  .schema == "fm-herdr-linear-inventory.v1"
+  and ((.home | type) == "string" and (.home | length) > 0)
+  and (.children | type) == "array"
+  and all(.children[]?;
+    ((.task_id | type) == "string" and (.task_id | length) > 0)
+    and (.linear_card_id | type) == "string"
+    and (.backend | type) == "string"
+    and (.endpoint | type) == "string"
+    and (.herdr_session | type) == "string"
+    and (.herdr_pane_id | type) == "string"
+    and (.pr | type) == "string"
+    and (.endpoint_status as $status
+      | ["alive", "dead", "missing", "ambiguous", "unreadable", "unverified", "not-applicable"]
+      | index($status) != null))
+' "$ZEUS_INVENTORY" >/dev/null 2>&1 || {
+  echo 'fm-herdr-linear-reconcile: Zeus inventory is invalid' >&2
+  exit 1
+}
+cp "$ZEUS_INVENTORY" "$TMP/zeus.json"
 
-if [ "$LINEAR_API" = 1 ]; then
-  command -v curl >/dev/null 2>&1 || {
+command -v curl >/dev/null 2>&1 || {
     echo 'fm-herdr-linear-reconcile: curl is required for --linear-api' >&2
     exit 1
   }
@@ -241,40 +230,20 @@ if [ "$LINEAR_API" = 1 ]; then
     [ "$(jq -r '.data.issues.pageInfo.hasNextPage' "$TMP/linear-api.json")" = true ] || break
     cursor=$(jq -r '.data.issues.pageInfo.endCursor' "$TMP/linear-api.json")
   done
-  jq -n --slurpfile cards "$TMP/linear-cards.json" '{cards:$cards[0]}' > "$TMP/linear-api-all.json"
-  load_cards "$TMP/linear-api-all.json" || exit 1
-else
-  load_cards "$CARDS_FILE" || exit 1
-fi
-
-if [ -n "$ZEUS_INVENTORY" ]; then
-  [ -f "$ZEUS_INVENTORY" ] && [ ! -L "$ZEUS_INVENTORY" ] || {
-    echo "fm-herdr-linear-reconcile: Zeus inventory is unavailable at $ZEUS_INVENTORY" >&2
-    exit 1
-  }
   jq -e '
-    .schema == "fm-herdr-linear-inventory.v1"
-    and ((.home | type) == "string" and (.home | length) > 0)
-    and (.children | type) == "array"
-    and all(.children[]?;
-      ((.task_id | type) == "string" and (.task_id | length) > 0)
-      and (.linear_card_id | type) == "string"
-      and (.backend | type) == "string"
-      and (.endpoint | type) == "string"
-      and (.herdr_session | type) == "string"
-      and (.herdr_pane_id | type) == "string"
-      and (.pr | type) == "string"
-      and (.endpoint_status as $status
-        | ["alive", "dead", "missing", "ambiguous", "unreadable", "unverified", "not-applicable"]
-        | index($status) != null))
-  ' "$ZEUS_INVENTORY" >/dev/null 2>&1 || {
-    echo 'fm-herdr-linear-reconcile: Zeus inventory is invalid' >&2
+    map({id:(.id // ""), identifier:(.identifier // ""),
+         state:(if (.state | type) == "object" then (.state.name // "") else (.state // "") end)})
+    | if all(.[];
+        ((.id | type) == "string" and (.id | length) > 0)
+        and ((.identifier | type) == "string" and (.identifier | length) > 0)
+        and (.state | type) == "string")
+      then . else error("a card is missing id, identifier, or state") end
+    | map(select(.state == "In Progress" or .state == "In Review"))
+    | sort_by(.id, .identifier)
+  ' "$TMP/linear-cards.json" > "$TMP/cards.json" || {
+    echo 'fm-herdr-linear-reconcile: Linear API returned invalid cards' >&2
     exit 1
   }
-  cp "$ZEUS_INVENTORY" "$TMP/zeus.json"
-else
-  printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":null,"children":[]}' > "$TMP/zeus.json"
-fi
 
 REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.json" --slurpfile cards "$TMP/cards.json" '
   ($local[0].children + $zeus[0].children) as $workers
