@@ -17,7 +17,8 @@
 # `--cards` accepts either Linear's GraphQL response
 # `{data:{issues:{nodes:[...]}}}` or `{cards:[...]}` with id, identifier, and
 # state fields. `--linear-api` fetches the same source using LINEAR_API_KEY and
-# FM_LINEAR_OPERATING_STUDIO_TEAM_ID. It never prints either secret.
+# FM_LINEAR_OPERATING_STUDIO_TEAM_ID and
+# FM_LINEAR_OPERATING_STUDIO_PROJECT_ID. It never prints the API key.
 #
 # Output is schema fm-herdr-linear-reconcile.v1. `--json` prints one stable
 # machine-readable object; the default is a concise summary followed by the
@@ -112,10 +113,10 @@ safe_field() { # metadata values become TSV fields
 }
 
 # local_inventory writes a compact, home-owned inventory. The only live lookup
-# is an exact Herdr agent get for each recorded Herdr endpoint, not a global
-# pane list or a title/order heuristic.
+# is the shared process-backed classifier for each recorded Herdr endpoint, not
+# a global pane list or a title/order heuristic.
 local_inventory() {
-  local rows="$TMP/local.rows" meta id kind backend endpoint card session pane pr response status
+  local rows="$TMP/local.rows" meta id kind backend endpoint card session pane pr status
   : > "$rows"
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] && [ ! -L "$meta" ] || continue
@@ -133,15 +134,8 @@ local_inventory() {
       if [ -z "$session" ] || [ -z "$pane" ] || [ "$endpoint" != "$session:$pane" ]; then
         status=unreadable
       else
-        response=$(fm_backend_herdr_cli "$session" agent get "$pane" 2>/dev/null || true)
-        if printf '%s' "$response" | jq -e '.result.agent | type == "object"' >/dev/null 2>&1; then
-          status=$(printf '%s' "$response" | jq -r '.result.agent.agent_status // "unknown"' 2>/dev/null || printf unknown)
-          case "$status" in working|idle|done|blocked) : ;; *) status=unknown ;; esac
-        elif printf '%s' "$response" | jq -e '.error.code? == "agent_not_found" or .error.code? == "pane_not_found"' >/dev/null 2>&1; then
-          status=missing
-        else
-          status=unreadable
-        fi
+        status=$(fm_backend_agent_state "$backend" "$endpoint")
+        case "$status" in alive|dead|missing|ambiguous|unreadable|unverified) : ;; *) status=unreadable ;; esac
       fi
     fi
     for value in "$id" "$card" "$backend" "$endpoint" "$session" "$pane" "$pr" "$status"; do
@@ -188,7 +182,10 @@ load_cards() {
     else error("expected cards[] or data.issues.nodes[]") end
     | map({id:(.id // ""), identifier:(.identifier // ""),
            state:(if (.state | type) == "object" then (.state.name // "") else (.state // "") end)})
-    | if all(.[]; (.id | type) == "string" and length > 0 and (.identifier | type) == "string" and length > 0 and (.state | type) == "string")
+    | if all(.[];
+        ((.id | type) == "string" and (.id | length) > 0)
+        and ((.identifier | type) == "string" and (.identifier | length) > 0)
+        and (.state | type) == "string")
       then . else error("a card is missing id, identifier, or state") end
     | map(select(.state == "In Progress" or .state == "In Review"))
     | sort_by(.id, .identifier)
@@ -203,20 +200,49 @@ if [ "$LINEAR_API" = 1 ]; then
     echo 'fm-herdr-linear-reconcile: curl is required for --linear-api' >&2
     exit 1
   }
-  : "${LINEAR_API_KEY:?fm-herdr-linear-reconcile: LINEAR_API_KEY is required for --linear-api}"
-  : "${FM_LINEAR_OPERATING_STUDIO_TEAM_ID:?fm-herdr-linear-reconcile: FM_LINEAR_OPERATING_STUDIO_TEAM_ID is required for --linear-api}"
-  payload=$(jq -cn --arg team "$FM_LINEAR_OPERATING_STUDIO_TEAM_ID" '{query:"query OperatingStudioCards($team: ID!) { issues(first: 250, filter: { team: { id: { eq: $team } }, state: { name: { in: [\"In Progress\", \"In Review\"] } } }) { nodes { id identifier state { name } } } }",variables:{team:$team}}')
-  if ! curl --fail --silent --show-error --max-time 15 \
-    -H 'Content-Type: application/json' -H "Authorization: $LINEAR_API_KEY" \
-    --data "$payload" https://api.linear.app/graphql > "$TMP/linear-api.json"; then
-    echo 'fm-herdr-linear-reconcile: Linear API request failed' >&2
+  [ -n "${LINEAR_API_KEY:-}" ] || {
+    echo 'fm-herdr-linear-reconcile: LINEAR_API_KEY is required for --linear-api' >&2
     exit 1
-  fi
-  if jq -e '.errors | type == "array" and length > 0' "$TMP/linear-api.json" >/dev/null 2>&1; then
-    echo 'fm-herdr-linear-reconcile: Linear API returned an error' >&2
+  }
+  [ -n "${FM_LINEAR_OPERATING_STUDIO_TEAM_ID:-}" ] || {
+    echo 'fm-herdr-linear-reconcile: FM_LINEAR_OPERATING_STUDIO_TEAM_ID is required for --linear-api' >&2
     exit 1
-  fi
-  load_cards "$TMP/linear-api.json" || exit 1
+  }
+  [ -n "${FM_LINEAR_OPERATING_STUDIO_PROJECT_ID:-}" ] || {
+    echo 'fm-herdr-linear-reconcile: FM_LINEAR_OPERATING_STUDIO_PROJECT_ID is required for --linear-api' >&2
+    exit 1
+  }
+  printf '%s\n' '[]' > "$TMP/linear-cards.json"
+  cursor=
+  while :; do
+    payload=$(jq -cn \
+      --arg team "$FM_LINEAR_OPERATING_STUDIO_TEAM_ID" \
+      --arg project "$FM_LINEAR_OPERATING_STUDIO_PROJECT_ID" \
+      --arg after "$cursor" \
+      '{query:"query OperatingStudioCards($team: ID!, $project: ID!, $after: String) { issues(first: 250, after: $after, filter: { team: { id: { eq: $team } }, project: { id: { eq: $project } }, state: { name: { in: [\"In Progress\", \"In Review\"] } } }) { nodes { id identifier state { name } } pageInfo { hasNextPage endCursor } } }",variables:{team:$team,project:$project,after:(if $after == "" then null else $after end)}}')
+    if ! curl --fail --silent --show-error --max-time 15 \
+      -H 'Content-Type: application/json' -H "Authorization: $LINEAR_API_KEY" \
+      --data "$payload" https://api.linear.app/graphql > "$TMP/linear-api.json"; then
+      echo 'fm-herdr-linear-reconcile: Linear API request failed' >&2
+      exit 1
+    fi
+    if ! jq -e '
+      ((.errors // []) | type == "array" and length == 0)
+      and (.data.issues.nodes | type) == "array"
+      and (.data.issues.pageInfo.hasNextPage | type) == "boolean"
+      and ((.data.issues.pageInfo.endCursor | type) == "string" or .data.issues.pageInfo.endCursor == null)
+      and (.data.issues.pageInfo.hasNextPage == false or (.data.issues.pageInfo.endCursor | type) == "string" and (.data.issues.pageInfo.endCursor | length) > 0)
+    ' "$TMP/linear-api.json" >/dev/null 2>&1; then
+      echo 'fm-herdr-linear-reconcile: Linear API returned an invalid response' >&2
+      exit 1
+    fi
+    jq -s '.[0] + .[1].data.issues.nodes' "$TMP/linear-cards.json" "$TMP/linear-api.json" > "$TMP/linear-cards.next.json"
+    mv "$TMP/linear-cards.next.json" "$TMP/linear-cards.json"
+    [ "$(jq -r '.data.issues.pageInfo.hasNextPage' "$TMP/linear-api.json")" = true ] || break
+    cursor=$(jq -r '.data.issues.pageInfo.endCursor' "$TMP/linear-api.json")
+  done
+  jq -n --slurpfile cards "$TMP/linear-cards.json" '{cards:$cards[0]}' > "$TMP/linear-api-all.json"
+  load_cards "$TMP/linear-api-all.json" || exit 1
 else
   load_cards "$CARDS_FILE" || exit 1
 fi
@@ -228,8 +254,19 @@ if [ -n "$ZEUS_INVENTORY" ]; then
   }
   jq -e '
     .schema == "fm-herdr-linear-inventory.v1"
+    and ((.home | type) == "string" and (.home | length) > 0)
     and (.children | type) == "array"
-    and all(.children[]?; (.task_id | type) == "string" and (.endpoint_status | type) == "string")
+    and all(.children[]?;
+      ((.task_id | type) == "string" and (.task_id | length) > 0)
+      and (.linear_card_id | type) == "string"
+      and (.backend | type) == "string"
+      and (.endpoint | type) == "string"
+      and (.herdr_session | type) == "string"
+      and (.herdr_pane_id | type) == "string"
+      and (.pr | type) == "string"
+      and (.endpoint_status as $status
+        | ["alive", "dead", "missing", "ambiguous", "unreadable", "unverified", "not-applicable"]
+        | index($status) != null))
   ' "$ZEUS_INVENTORY" >/dev/null 2>&1 || {
     echo 'fm-herdr-linear-reconcile: Zeus inventory is invalid' >&2
     exit 1
@@ -270,10 +307,10 @@ REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.j
               {kind:"missing-endpoint", card_id:$card.id, identifier:$card.identifier,
                task_id:$worker.task_id, endpoint:$worker.endpoint,
                detail:"Herdr has no agent for the recorded endpoint"}
-            elif $worker.endpoint_status != "working" then
+            elif $worker.endpoint_status != "alive" then
               {kind:"needs-deep-check", card_id:$card.id, identifier:$card.identifier,
                task_id:$worker.task_id, endpoint:$worker.endpoint,
-               detail:("Herdr cannot prove productive work (agent status " + $worker.endpoint_status + ")")}
+               detail:("Herdr cannot prove a live worker (endpoint status " + $worker.endpoint_status + ")")}
             elif $card.state == "In Review" and ($worker.pr | length) == 0 then
               {kind:"board-column-mismatch-needs-pr-review", card_id:$card.id, identifier:$card.identifier,
                task_id:$worker.task_id, endpoint:$worker.endpoint,
@@ -285,7 +322,7 @@ REPORT=$(jq -n --slurpfile local "$TMP/local.json" --slurpfile zeus "$TMP/zeus.j
             else
               {kind:"matched-live-endpoint", card_id:$card.id, identifier:$card.identifier,
                task_id:$worker.task_id, endpoint:$worker.endpoint,
-               detail:"recorded Herdr endpoint is working"}
+               detail:"recorded Herdr endpoint has a live agent process"}
             end
         end
     ] as $card_findings
