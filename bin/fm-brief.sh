@@ -60,6 +60,11 @@
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
 # "blocked:": pause for a known external wait expected to clear on its own,
 # blocked when firstmate must act.
+# Where a scaffold tells the worker to sit on a long wait - polling the
+# no-mistakes pipeline, or a scout's long run - it also requires declaring that
+# wait at that point of use, once before the polling starts rather than once per
+# poll, because an undeclared silent worker is indistinguishable from a dead one
+# and escalates as a possible wedge.
 # Emission-time syntax and legacy unknown-time handling are owned by
 # bin/fm-classify-lib.sh; each scaffold renders the stamp as a literal <epoch>
 # placeholder the worker replaces with a numeric Unix time as it appends, so a
