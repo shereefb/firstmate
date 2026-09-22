@@ -41,6 +41,7 @@ case "${1:-} ${2:-}" in
         {workspace_id:"w-parent",label:"firstmate"},
         {workspace_id:"w-projected",label:("└ projected · p:" + $token)}]}}' ;;
       moved) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-moved","label":"firstmate"}]}}' ;;
+      ambiguous-owner) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-moved","label":"firstmate"}]}}' ;;
       zeus) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-zeus","label":"firstmate"}]}}' ;;
       zeus-moved) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"},{"workspace_id":"w-zeus-moved","label":"firstmate"}]}}' ;;
       *) printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w-owned","label":"firstmate"}]}}' ;;
@@ -50,9 +51,9 @@ case "${1:-} ${2:-}" in
     case "$mode:$workspace" in
       inherited:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"fm-buildboard"},{"tab_id":"t-unrecorded","label":"fm-unrecorded"}]}}' ;;
       inherited:w-foreign) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-foreign","label":"fm-foreign"}]}}' ;;
-      moved:w-moved) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-moved","label":"fm-buildboard"},{"tab_id":"t-moved-worker","label":"fm-moved-worker"}]}}' ;;
+      moved:w-moved|ambiguous-owner:w-moved) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-moved","label":"fm-renamed-owner"},{"tab_id":"t-moved-worker","label":"fm-moved-worker"}]}}' ;;
       zeus:w-zeus) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus","label":"fm-zeus"},{"tab_id":"t-zeus-worker","label":"fm-zeus-worker"}]}}' ;;
-      zeus-moved:w-zeus-moved) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus-moved","label":"fm-zeus"},{"tab_id":"t-zeus-worker","label":"fm-zeus-worker"}]}}' ;;
+      zeus-moved:w-zeus-moved) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus-moved","label":"fm-renamed-zeus"},{"tab_id":"t-zeus-worker","label":"fm-zeus-worker"}]}}' ;;
       projection:w-projected) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-projected","label":"fm-projected"}]}}' ;;
       *:w-owned) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-launch","label":"fm-buildboard"}]}}' ;;
       *:w-zeus) printf '%s\n' '{"result":{"tabs":[{"tab_id":"t-zeus","label":"fm-zeus"}]}}' ;;
@@ -64,6 +65,7 @@ case "${1:-} ${2:-}" in
       inherited:w-owned) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-launch"},{"pane_id":"p-unrecorded","tab_id":"t-unrecorded"}]}}' ;;
       inherited:w-foreign) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-foreign","tab_id":"t-foreign"}]}}' ;;
       moved:w-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-moved"},{"pane_id":"p-moved-worker","tab_id":"t-moved-worker"}]}}' ;;
+      ambiguous-owner:w-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-launch","tab_id":"t-moved"},{"pane_id":"p-launch","tab_id":"t-moved"},{"pane_id":"p-moved-worker","tab_id":"t-moved-worker"}]}}' ;;
       zeus:w-zeus) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus","tab_id":"t-zeus"},{"pane_id":"p-zeus-worker","tab_id":"t-zeus-worker"}]}}' ;;
       zeus-moved:w-zeus-moved) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-zeus","tab_id":"t-zeus-moved"},{"pane_id":"p-zeus-worker","tab_id":"t-zeus-worker"}]}}' ;;
       projection:w-projected) printf '%s\n' '{"result":{"panes":[{"pane_id":"p-projected","tab_id":"t-projected"}]}}' ;;
@@ -77,7 +79,7 @@ case "${1:-} ${2:-}" in
     case "${3:-}" in
       p-missing) printf '%s\n' '{"error":{"code":"pane_not_found"}}' ;;
       p-launch)
-        if [ "$mode" = moved ]; then
+        if [ "$mode" = moved ] || [ "$mode" = ambiguous-owner ]; then
           printf '%s\n' '{"result":{"pane":{"pane_id":"p-launch","tab_id":"t-moved","workspace_id":"w-moved"}}}'
         else
           printf '%s\n' '{"result":{"pane":{"pane_id":"p-launch","tab_id":"t-launch","workspace_id":"w-owned"}}}'
@@ -338,6 +340,17 @@ test_exact_live_worker_ownership_is_discovered() {
     and .local_inventory.children[0].endpoint == "jarvis:p-moved-worker"
     and .local_inventory.children[0].endpoint_status == "alive"
   ' >/dev/null || fail "moved owner workspace was not resolved from its live endpoint: $out"
+
+  dir=$(make_case ambiguous-owner)
+  cards="$dir/cards.json"
+  printf '%s\n' '{"cards":[]}' > "$cards"
+  out=$(FM_TEST_HERDR_DISCOVERY=ambiguous-owner run_reconcile "$dir" "$cards" 2>&1) \
+    && rc=0 || rc=$?
+  [ "$rc" -ne 0 ] || fail "duplicate live owner pane was accepted"
+  case "$out" in
+    *'could not enumerate inventory Herdr workspace'*) ;;
+    *) fail "ambiguous live owner diagnostic drifted: $out" ;;
+  esac
 
   dir=$(make_case projected-worker)
   cards="$dir/cards.json"

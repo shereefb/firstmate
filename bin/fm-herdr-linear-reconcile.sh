@@ -132,7 +132,6 @@ resolve_inventory_owner() {
   local marker="$FM_HOME/.fm-secondmate-home" parent="$FM_HOME/.fm-secondmate-parent"
   local owner meta recorded_home canonical_home canonical_recorded status pane_out owner_location
   local workspaces_out tabs_out
-  INVENTORY_OWNER_ID=
   INVENTORY_OWNER_SESSION=
   INVENTORY_OWNER_WORKSPACE=
   INVENTORY_OWNER_TAB=
@@ -155,7 +154,6 @@ resolve_inventory_owner() {
     [ "$canonical_recorded" = "$canonical_home" ] || return 1
     fm_backend_validate_task_endpoint "$meta" "$owner" 2>/dev/null || return 1
     [ "$FM_BACKEND_VALIDATED_BACKEND" = herdr ] || return 1
-    INVENTORY_OWNER_ID=$owner
     INVENTORY_OWNER_SESSION=$(meta_value "$meta" herdr_session)
     INVENTORY_OWNER_PANE=$(meta_value "$meta" herdr_pane_id)
     [ "$FM_BACKEND_VALIDATED_TARGET" = "$INVENTORY_OWNER_SESSION:$INVENTORY_OWNER_PANE" ] \
@@ -209,21 +207,28 @@ discover_owned_flat_workers() { # <rows>
       and (.label | type) == "string")' "$tabs" >/dev/null 2>&1 \
     || ! fm_backend_herdr_cli "$INVENTORY_OWNER_SESSION" pane list \
       --workspace "$INVENTORY_OWNER_WORKSPACE" > "$panes" 2>/dev/null \
-    || ! jq -e '(.result.panes | type) == "array" and all(.result.panes[]?;
+    || ! jq -e --arg owner_pane "$INVENTORY_OWNER_PANE" \
+      --arg owner_tab "$INVENTORY_OWNER_TAB" '
+      (.result.panes | type) == "array" and all(.result.panes[]?;
       (.pane_id | type) == "string" and (.pane_id | length) > 0
-      and (.tab_id | type) == "string" and (.tab_id | length) > 0)' "$panes" >/dev/null 2>&1; then
+      and (.tab_id | type) == "string" and (.tab_id | length) > 0)
+      and ([.result.panes[] | select(.pane_id == $owner_pane)] | length) == 1
+      and any(.result.panes[];
+        .pane_id == $owner_pane and .tab_id == $owner_tab)
+    ' "$panes" >/dev/null 2>&1; then
     echo "fm-herdr-linear-reconcile: could not enumerate inventory Herdr workspace $INVENTORY_OWNER_WORKSPACE" >&2
     return 1
   fi
   while IFS=$'\t' read -r pane task_id; do
     [ -n "$pane" ] || continue
     append_live_worker "$rows" "$task_id" "$INVENTORY_OWNER_SESSION" "$pane" || return 1
-  done < <(jq -r --slurpfile panes "$panes" --arg owner "$INVENTORY_OWNER_ID" '
+  done < <(jq -r --slurpfile panes "$panes" --arg owner_pane "$INVENTORY_OWNER_PANE" '
     .result.tabs[]
     | select(.label | startswith("fm-") and length > 3)
-    | select($owner == "" or .label != ("fm-" + $owner)) as $tab
+    | . as $tab
     | $panes[0].result.panes[]
     | select(.tab_id == $tab.tab_id)
+    | select(.pane_id != $owner_pane)
     | [.pane_id, $tab.label[3:]]
     | @tsv
   ' "$tabs")
