@@ -1121,6 +1121,23 @@ Cross-session and contradictory bindings are covered deterministically in `tests
 
 ### Per-home and presentation topology
 
+The Operating Studio inventory guard ran on 2026-09-22 against Herdr 0.9.1 protocol 22 in a private named lab session:
+
+```sh
+FM_HERDR_LINEAR_INVENTORY_LIVE_E2E=1 bin/fm-test-run.sh tests/fm-herdr-linear-inventory-live-e2e.test.sh
+```
+
+It moved the registered owner pane into a new workspace and a worker-shaped tab, then executed the public `--inventory` command against the real owner, workspace, tab, pane, agent, and process responses.
+The old registered workspace retained an unrecorded flat child, and an exact version 2 projection journal bound a second child through its own workspace and the old parent.
+
+```text
+ok - real Herdr inventory keeps registered and projected workers after an owner move
+ok - real Herdr inventory excludes the exact moved owner pane under a worker-shaped tab
+evidence: herdr 0.9.1 protocol=22
+```
+
+The result was `needs-deep-check`, included both live children, and excluded the moved owner by its exact pane identity rather than its mutable tab label.
+
 Per-home behavior is owned by:
 
 ```sh

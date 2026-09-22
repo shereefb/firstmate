@@ -101,14 +101,6 @@ out=$(FM_HOME="$HOME_DIR" FM_HERDR_LINEAR_CHECK_NOW=4600 "$CHECK" check) || fail
 rm -f "$HOME_DIR/state/.herdr-linear-reconcile-check"
 pass "cadence persistence failure emits one actionable line"
 
-FM_HOME="$HOME_DIR" FM_STATE_OVERRIDE="$OTHER_STATE" "$CHECK" retire >/dev/null || fail "check did not retire"
-FM_HOME="$HOME_DIR" "$CHECK" retire >/dev/null || fail "second retirement was not idempotent"
-[ ! -e "$HOME_DIR/state/herdr-linear-reconcile.check.sh" ] || fail "retirement left the check shim"
-[ ! -e "$HOME_DIR/state/herdr-linear-reconcile.check-trust" ] || fail "retirement left the trust binding"
-[ ! -e "$HOME_DIR/state/.herdr-linear-reconcile-check" ] || fail "retirement left the cadence record"
-[ ! -e "$OTHER_STATE/herdr-linear-reconcile.check.sh" ] || fail "retirement used an inherited state override"
-pass "retirement is idempotent and removes owned check state"
-
 printf '%s\n' another-mate > "$HOME_DIR/.fm-secondmate-home"
 out=$(FM_HOME="$HOME_DIR" "$CHECK" arm 2>&1) && rc=0 || rc=$?
 [ "$rc" -ne 0 ] || fail "another secondmate armed the buildboard check"

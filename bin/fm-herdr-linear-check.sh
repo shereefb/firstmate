@@ -4,7 +4,6 @@
 # Usage:
 #   fm-herdr-linear-check.sh [check]
 #   fm-herdr-linear-check.sh arm
-#   fm-herdr-linear-check.sh retire
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,7 +47,6 @@ usage() {
 Usage:
   fm-herdr-linear-check.sh [check]   reconcile when the 15-minute interval is due
   fm-herdr-linear-check.sh arm       arm the trusted buildboard custom check
-  fm-herdr-linear-check.sh retire    retire the custom check and cadence record
 EOF
 }
 
@@ -135,7 +133,7 @@ action_check() {
   fi
 
   if ! owner_valid; then
-    finish_check "$now" 'Operating Studio reconciliation check failed: this trusted check must run from the persistent buildboard home; retire it here and arm it from buildboard'
+    finish_check "$now" 'Operating Studio reconciliation check failed: this trusted check must run from the persistent buildboard home; remove the stale custom check from this home and arm it from buildboard'
     return 0
   fi
 
@@ -245,16 +243,9 @@ action_arm() {
   printf 'armed: state/%s.check.sh\n' "$CHECK_ID"
 }
 
-action_retire() {
-  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$SCRIPT_DIR/fm-check-unregister.sh" "$CHECK_ID" >/dev/null || return 1
-  rm -f -- "$RECORD"
-  printf 'retired: state/%s.check.sh\n' "$CHECK_ID"
-}
-
 case "${1:-check}" in
   check) action_check ;;
   arm) action_arm ;;
-  retire) action_retire ;;
   -h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

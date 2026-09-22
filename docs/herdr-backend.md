@@ -234,10 +234,10 @@ Each inventory joins workers from every exact flat workspace proven by the ownin
 An owner workspace move marks the result for deeper inspection because Herdr does not expose complete pane-move history for unrecorded workers.
 The command idempotently installs one hash-bound custom check on the existing watcher, gates reconciliation to one run every 15 minutes, and applies an internal deadline three seconds below the watcher timeout.
 It stays silent when every identity and count matches, and emits one actionable line when deeper inspection is needed, reconciliation fails, or cadence state cannot be saved.
-Run `bin/fm-herdr-linear-check.sh retire` to remove the shim, trust binding, and cadence record idempotently.
 This uses no cron, background loop, or second coordinator, and the credential is never written into the tracked shim or repository.
 `tests/fm-herdr-linear-reconcile.test.sh` covers the portable behavior.
 `tests/fm-herdr-linear-check.test.sh` covers automatic ownership and lifecycle behavior.
+`tests/fm-herdr-linear-inventory-live-e2e.test.sh` verifies owner moves and registered, current, and projected worker inventory against a real isolated Herdr session.
 
 ## Current transport behavior
 
