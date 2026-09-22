@@ -303,6 +303,25 @@ This does not relax protection for any other untracked file.
 An existing linked-worktree home that predates this rule advances through its marker-only state during its next bootstrap or spawn local sync, after which Git ignores the marker normally.
 A local standalone-clone home cannot receive a primary-local commit through that no-fetch sync, so it receives the rule through `/updatefirstmate`'s origin refresh instead.
 
+## Operating Studio board loop (.env.linear.local)
+
+The gitignored `.env.linear.local` file opts one Firstmate home into the
+Operating Studio board loop. It contains
+`FM_LINEAR_OPERATING_STUDIO_TEAM_ID`,
+`FM_LINEAR_OPERATING_STUDIO_PROJECT_ID`, and either
+`FM_LINEAR_READONLY_API_KEY` or `LINEAR_API_KEY` for board reads.
+`FM_LINEAR_WRITE_API_KEY` separately authorizes the two evidence-gated state
+transitions owned by `bin/fm-board-loop.sh enforce`. Environment values remain
+valid for direct invocations. `FM_LINEAR_CONFIG_FILE` may select another
+home-local file.
+
+The watcher runs enforcement at most once every 900 seconds. Set
+`FM_BOARD_LOOP_INTERVAL` to another positive whole number of seconds when a
+home needs a different cadence. A secondmate such as Zues has an independent
+home and therefore needs its own local file or environment values. Firstmate
+does not copy these credentials between homes, and no Linear secret belongs in
+tracked configuration.
+
 ## FM_HOME
 
 `FM_HOME` selects the operational home for one firstmate instance.

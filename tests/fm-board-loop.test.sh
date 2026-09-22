@@ -34,6 +34,32 @@ case "$1" in
   *) printf '{"state":"OPEN","isDraft":false,"headRefOid":"%s"}\n' "${FM_TEST_OPEN_HEAD:-head1}" ;;
 esac
 SH
+  cat > "$world/fakebin/crew" <<'SH'
+#!/usr/bin/env bash
+printf 'state: %s · source: test\n' "${FM_TEST_CREW_STATE:-working}"
+SH
+  cat > "$world/fakebin/curl" <<'SH'
+#!/usr/bin/env bash
+payload=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --data ]; then shift; payload=$1; break; fi
+  shift
+done
+if printf '%s' "$payload" | jq -e '.query | contains("workflowStates")' >/dev/null 2>&1; then
+  printf '{"data":{"workflowStates":{"nodes":[{"id":"state-review","name":"In Review"},{"id":"state-deploy","name":"Ready to Deploy"}]}}}\n'
+  exit 0
+fi
+issue=$(printf '%s' "$payload" | jq -r '.variables.issue')
+if printf '%s' "$payload" | jq -e '.query | startswith("query Issue")' >/dev/null 2>&1; then
+  state=$(cat "${FM_TEST_LINEAR_STATE_FILE:?}")
+  printf '{"data":{"issue":{"id":"%s","state":{"name":"%s"}}}}\n' "$issue" "$state"
+  exit 0
+fi
+state_id=$(printf '%s' "$payload" | jq -r '.variables.state')
+case "$state_id" in state-review) state='In Review' ;; state-deploy) state='Ready to Deploy' ;; *) exit 1 ;; esac
+printf '%s\n' "$state" > "${FM_TEST_LINEAR_STATE_FILE:?}"
+printf '{"data":{"issueUpdate":{"success":true,"issue":{"id":"%s","state":{"name":"%s"}}}}}\n' "$issue" "$state"
+SH
   cat > "$world/fakebin/send" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$1" >> "${FM_TEST_SEND_LOG:-/dev/null}"
@@ -47,10 +73,10 @@ run_scan() { # <world> <now> [args...]
   local world=$1 now=$2
   shift 2
   FM_HOME="$world/home" FM_STATE_OVERRIDE="$world/home/state" FM_DATA_OVERRIDE="$world/home/data" \
-    FM_BOARD_LOOP_NOW="$now" FM_BOARD_LOOP_CREW_STATE_CMD='' \
+    FM_BOARD_LOOP_NOW="$now" FM_BOARD_LOOP_CREW_STATE_CMD="${FM_TEST_CREW_STATE_CMD-}" \
     FM_BOARD_LOOP_HERDR_CLI="$world/fakebin/agent" \
     FM_BOARD_LOOP_ENDPOINT_STATUS_CMD="$world/fakebin/endpoint" \
-    FM_BOARD_LOOP_PR_PROBE_CMD="$world/fakebin/pr" \
+    FM_BOARD_LOOP_PR_PROBE_CMD="${FM_TEST_PR_PROBE_CMD-$world/fakebin/pr}" \
     FM_BOARD_LOOP_SEND_CMD="$world/fakebin/send" \
     "$SCRIPT" "$@"
 }
@@ -277,7 +303,7 @@ test_rolling_hour_and_zero_landing_fault() {
   write_cards "$world/cards.json" \
     '[{"id":"card-A","identifier":"COD-A","state":"In Progress","title":"a","url":"u"}]'
   local out
-  out=$(run_scan "$world" 5000 --cards "$world/cards.json")
+  out=$(FM_TEST_CREW_STATE_CMD="$world/fakebin/crew" run_scan "$world" 5000 --cards "$world/cards.json")
   assert_equals "1" "$(printf '%s' "$out" | jq -r '.capacity.productive')" \
     "a live working lane is productive"
   assert_equals "true" "$(printf '%s' "$out" | jq -r '.throughput.fault')" \
@@ -285,7 +311,7 @@ test_rolling_hour_and_zero_landing_fault() {
   # A landing older than the window does not count.
   printf '%s\n' "0	card-Z	https://example.com/merged/old	oldhead" \
     > "$world/home/state/.board-loop-deploy-history"
-  out=$(run_scan "$world" 100000 --cards "$world/cards.json")
+  out=$(FM_TEST_CREW_STATE_CMD="$world/fakebin/crew" run_scan "$world" 100000 --cards "$world/cards.json")
   assert_equals "0" "$(printf '%s' "$out" | jq -r '.throughput.verified_ready_to_deploy')" \
     "a landing outside the rolling hour does not count"
   assert_equals "true" "$(printf '%s' "$out" | jq -r '.throughput.fault')" \
@@ -294,17 +320,19 @@ test_rolling_hour_and_zero_landing_fault() {
 }
 
 test_idle_done_unconsumed_decision_replay() {
-  # The measured replay: a decision was recorded and even acknowledged, but the
-  # idle/done child never consumed it and the card is still In Progress.
+  # The measured replay uses the public answer path: the answer closes the open
+  # key, the worker acknowledges its exact inbox record, then produces no output.
   local world
   world=$(make_world decision-replay)
   fm_write_meta "$world/home/state/child.meta" \
     "kind=ship" "backend=tmux" "window=jarvis:1" "linear_card_id=card-D"
   printf '%s\n' 'needs-decision [at=999] [key=gate-1]: choose a path' \
     > "$world/home/state/child.status"
+  FM_HOME="$world/home" FM_STATE_OVERRIDE="$world/home/state" FM_SEND_SETTLE=0 \
+    "$ROOT/bin/fm-send.sh" child --resolve-key gate-1 answer >/dev/null 2>&1 \
+    || fail "public decision answer failed"
   mkdir -p "$world/home/state/child.inbox/handled"
-  printf 'schema=fm-task-inbox.v1\nat=x\n--\nanswer\n' \
-    > "$world/home/state/child.inbox/handled/001.msg"
+  mv "$world/home/state/child.inbox/001.msg" "$world/home/state/child.inbox/handled/001.msg"
   write_cards "$world/cards.json" \
     '[{"id":"card-D","identifier":"COD-D","state":"In Progress","title":"d","url":"u"}]'
   local out
@@ -398,6 +426,135 @@ test_inventory_mode() {
   pass "inventory-mode"
 }
 
+test_remote_lane_owns_card() {
+  local world out
+  world=$(make_world remote-lane)
+  write_cards "$world/cards.json" \
+    '[{"id":"card-R","identifier":"COD-R","state":"In Progress","title":"r","url":"u"}]'
+  jq -n '{schema:"fm-board-inventory.v1",home:"remote",lanes:[{
+    task_id:"remote-worker",kind:"ship",backend:"tmux",endpoint:"remote:1",
+    linear_card_id:"card-R",agent_status:"working",endpoint_status:"alive",
+    disposition:"working",validation:"running",terminal:false,pr:"",pr_head:"",
+    pr_state:"unknown",pr_draft:false,pr_head_live:"",status_verb:"working",
+    status_size:10,agent_source:"available",validation_source:"available",
+    forge_source:"not-required"}]}' > "$world/remote.json"
+  out=$(run_scan "$world" 1000 --cards "$world/cards.json" --remote-inventory "$world/remote.json")
+  assert_equals "0" "$(printf '%s' "$out" | jq -r '[.causes[] | select(.kind=="orphan-card")] | length')" \
+    "a remote canonical lane owns its card"
+  assert_equals "1" "$(printf '%s' "$out" | jq -r '.capacity.productive')" \
+    "a healthy remote lane counts as productive capacity"
+  pass "remote-lane-owns-card"
+}
+
+test_non_herdr_lane_uses_crew_state() {
+  local world out
+  world=$(make_world non-herdr)
+  fm_write_meta "$world/home/state/worker.meta" \
+    "kind=ship" "backend=tmux" "window=jarvis:1" "linear_card_id=card-T"
+  printf '%s\n' 'working [at=999]: building' > "$world/home/state/worker.status"
+  write_cards "$world/cards.json" \
+    '[{"id":"card-T","identifier":"COD-T","state":"In Progress","title":"t","url":"u"}]'
+  out=$(FM_TEST_CREW_STATE_CMD="$world/fakebin/crew" run_scan "$world" 1000 --cards "$world/cards.json")
+  assert_equals "working" "$(printf '%s' "$out" | jq -r '.lanes[0].agent_status')" \
+    "backend-neutral crew state supplies agent status"
+  assert_equals "1" "$(printf '%s' "$out" | jq -r '.capacity.productive')" \
+    "a live tmux lane counts as productive"
+  pass "non-herdr-lane-uses-crew-state"
+}
+
+test_dependency_outages_fail_closed() {
+  local world out
+  world=$(make_world source-outage)
+  out=$(run_scan "$world" 1000)
+  assert_equals "unavailable" "$(printf '%s' "$out" | jq -r '.sources.linear')" \
+    "a Linear outage is explicit"
+  assert_equals "1" "$(printf '%s' "$out" | jq -r '[.causes[] | select(.detail | contains("Linear board"))] | length')" \
+    "a Linear outage is actionable"
+  printf '{"schema":"bad","lanes":[]}\n' > "$world/remote.json"
+  write_cards "$world/empty.json" '[]'
+  out=$(run_scan "$world" 1000 --cards "$world/empty.json" --remote-inventory "$world/remote.json")
+  assert_equals "unavailable" "$(printf '%s' "$out" | jq -r '.sources.remote')" \
+    "an invalid remote inventory is explicit"
+  pass "dependency-outages-fail-closed"
+}
+
+test_merged_head_drift_is_not_verified() {
+  local world out
+  world=$(make_world merged-drift)
+  fm_write_meta "$world/home/state/ship.meta" \
+    "kind=ship" "backend=tmux" "window=jarvis:1" "linear_card_id=card-D" \
+    "pr=https://example.com/merged/1" "pr_head=oldhead"
+  printf '%s\n' 'done [at=999]: merged' > "$world/home/state/ship.status"
+  write_cards "$world/cards.json" \
+    '[{"id":"card-D","identifier":"COD-D","state":"Ready to Deploy","title":"d","url":"u"}]'
+  out=$(FM_TEST_MERGED_HEAD=newhead run_scan "$world" 2000 --cards "$world/cards.json")
+  assert_equals "head-drift" "$(printf '%s' "$out" | jq -r '.causes[0].kind')" \
+    "merged head drift remains a cause"
+  assert_equals "0" "$(printf '%s' "$out" | jq -r '.throughput.verified_ready_to_deploy')" \
+    "a mismatched merged head is never recorded"
+  pass "merged-head-drift-is-not-verified"
+}
+
+test_recovery_retry_resets_after_clear() {
+  local world log
+  world=$(make_world recovery-retry)
+  fm_write_meta "$world/home/state/ship.meta" \
+    "kind=ship" "backend=tmux" "window=jarvis:1" "linear_card_id=card-D" \
+    "pr=https://example.com/open/1" "pr_head=head1"
+  printf '%s\n' 'done [at=999]: finished' > "$world/home/state/ship.status"
+  write_cards "$world/cards.json" \
+    '[{"id":"card-D","identifier":"COD-D","state":"In Progress","title":"d","url":"u"}]'
+  log="$world/send.log"; : > "$log"
+  FM_TEST_SEND_LOG="$log" run_scan "$world" 1000 recover --cards "$world/cards.json" >/dev/null
+  FM_TEST_SEND_LOG="$log" run_scan "$world" 1900 recover --cards "$world/cards.json" >/dev/null
+  FM_TEST_SEND_LOG="$log" run_scan "$world" 2800 recover --cards "$world/cards.json" >/dev/null
+  FM_TEST_SEND_LOG="$log" run_scan "$world" 3700 recover --cards "$world/cards.json" >/dev/null
+  assert_equals "3" "$(wc -l < "$log" | tr -d '[:space:]')" "one cause has a bounded retry ladder"
+  write_cards "$world/empty.json" '[]'
+  run_scan "$world" 4600 recover --cards "$world/empty.json" >/dev/null
+  FM_TEST_SEND_LOG="$log" run_scan "$world" 5500 recover --cards "$world/cards.json" >/dev/null
+  assert_equals "4" "$(wc -l < "$log" | tr -d '[:space:]')" \
+    "a cleared cause gets a fresh retry when it recurs"
+  pass "recovery-retry-resets-after-clear"
+}
+
+test_enforce_writes_linear_and_reads_back() {
+  local world state_file send_log
+  world=$(make_world enforce-linear)
+  state_file="$world/linear-state"
+  fm_write_meta "$world/home/state/ship.meta" \
+    "kind=ship" "backend=tmux" "window=jarvis:1" "linear_card_id=card-D" \
+    "pr=https://example.com/open/1" "pr_head=head1"
+  printf '%s\n' 'done [at=999]: finished' > "$world/home/state/ship.status"
+  write_cards "$world/cards.json" \
+    '[{"id":"card-D","identifier":"COD-D","state":"In Progress","title":"d","url":"u"}]'
+  printf 'FM_LINEAR_WRITE_API_KEY=test\nFM_LINEAR_OPERATING_STUDIO_TEAM_ID=team\n' \
+    > "$world/home/.env.linear.local"
+  send_log="$world/send.log"; : > "$send_log"
+  PATH="$world/fakebin:$PATH" FM_TEST_LINEAR_STATE_FILE="$state_file" FM_TEST_SEND_LOG="$send_log" \
+    run_scan "$world" 1000 enforce --cards "$world/cards.json" >/dev/null
+  assert_equals "In Review" "$(cat "$state_file")" \
+    "enforcement advances a verified green PR into independent review"
+  assert_equals "0" "$(wc -l < "$send_log" | tr -d '[:space:]')" \
+    "scheduled enforcement never wakes a stopped worker"
+  run_scan "$world" 1001 pause --reason stop >/dev/null
+  rm -f "$state_file"
+  PATH="$world/fakebin:$PATH" FM_TEST_LINEAR_STATE_FILE="$state_file" \
+    run_scan "$world" 1002 enforce --cards "$world/cards.json" >/dev/null 2>&1
+  assert_absent "$state_file" "a durable stop blocks Linear writes as well as steers"
+  run_scan "$world" 1003 resume >/dev/null
+  fm_write_meta "$world/home/state/ship.meta" \
+    "kind=ship" "backend=tmux" "window=jarvis:1" "linear_card_id=card-D" \
+    "pr=https://example.com/merged/1" "pr_head=deadbeef"
+  write_cards "$world/cards.json" \
+    '[{"id":"card-D","identifier":"COD-D","state":"Ready to Merge","title":"d","url":"u"}]'
+  PATH="$world/fakebin:$PATH" FM_TEST_LINEAR_STATE_FILE="$state_file" \
+    run_scan "$world" 1004 enforce --cards "$world/cards.json" >/dev/null
+  assert_equals "Ready to Deploy" "$(cat "$state_file")" \
+    "enforcement advances only an already merged exact head to deployment"
+  pass "enforce-writes-linear-and-reads-back"
+}
+
 test_orphan_card
 test_stop_posture_refuses_recovery
 test_stop_status_signal_gates_recovery
@@ -414,3 +571,9 @@ test_decision_recorded_but_undelivered
 test_failed_lane_branch_retry_stalls
 test_replay_idempotence
 test_inventory_mode
+test_remote_lane_owns_card
+test_non_herdr_lane_uses_crew_state
+test_dependency_outages_fail_closed
+test_merged_head_drift_is_not_verified
+test_recovery_retry_resets_after_clear
+test_enforce_writes_linear_and_reads_back

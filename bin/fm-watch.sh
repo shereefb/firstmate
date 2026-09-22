@@ -235,6 +235,10 @@ HOME_SUMMARY_INTERVAL=${FM_HOME_SUMMARY_INTERVAL:-300}
 case "$HOME_SUMMARY_INTERVAL" in
   ''|*[!0-9]*|0) HOME_SUMMARY_INTERVAL=300 ;;
 esac
+BOARD_LOOP_INTERVAL=${FM_BOARD_LOOP_INTERVAL:-900}
+case "$BOARD_LOOP_INTERVAL" in
+  ''|*[!0-9]*|0) BOARD_LOOP_INTERVAL=900 ;;
+esac
 SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trailing
                                       # signals (a status write, then the same turn's
                                       # turn-end hook) coalesce into one wake
@@ -2359,6 +2363,28 @@ while :; do
     fi
   else
     triage_log "inactive-outcome reconciliation unavailable"
+  fi
+
+  if [ -f "$FM_HOME/.env.linear.local" ] && [ ! -L "$FM_HOME/.env.linear.local" ] \
+    && [ "$(age_of "$STATE/.board-loop-last-run")" -ge "$BOARD_LOOP_INTERVAL" ]; then
+    touch "$STATE/.board-loop-last-run"
+    board_out=
+    if board_out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-board-loop.sh" enforce 2>/dev/null) \
+      && printf '%s' "$board_out" | jq -e '.schema == "fm-board-loop.v1"' >/dev/null 2>&1; then
+      board_sig=$(printf '%s' "$board_out" | jq -cS '[.causes[] | {kind,task_id,card_id,detail}]')
+      old_board_sig=$(cat "$STATE/.board-loop-last-cause" 2>/dev/null || true)
+      if [ "$board_sig" != "$old_board_sig" ]; then
+        printf '%s\n' "$board_sig" > "$STATE/.board-loop-last-cause"
+        if [ "$board_sig" != '[]' ]; then
+          reason="check: Operating Studio board loop found $(printf '%s' "$board_out" | jq -r '.summary.causes') actionable cause(s)"
+          fm_wake_append check operating-studio-board-loop "$reason" || exit 1
+          wake "$reason"
+        fi
+      fi
+    else
+      triage_log "Operating Studio board loop unavailable"
+    fi
   fi
 
   # Slow per-task checks (firstmate writes these, e.g. a merged-PR poll).

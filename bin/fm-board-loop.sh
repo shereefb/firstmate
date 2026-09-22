@@ -6,6 +6,7 @@
 #   fm-board-loop.sh [scan] [--cards <file>] [--remote-inventory <file>]
 #   fm-board-loop.sh inventory
 #   fm-board-loop.sh recover [--cards <file>] [--remote-inventory <file>]
+#   fm-board-loop.sh enforce [--cards <file>] [--remote-inventory <file>]
 #   fm-board-loop.sh pause [--reason <text>]
 #   fm-board-loop.sh resume
 #
@@ -26,6 +27,8 @@
 #     stop-status file (FM_BOARD_LOOP_STOP_STATUS) whose newest stop-key line is
 #     paused/blocked. A live endpoint is never evidence that recovery is safe.
 #     `scan` stays read-only and may run under the stop posture.
+#   * `enforce` directly advances only evidence-complete Linear transitions. It
+#     never steers a worker, reviews a PR, or merges a PR.
 #
 # Identity is authoritative and never inferred: a lane joins a card only by the
 # immutable Linear issue id recorded as `linear_card_id=` in task metadata, and
@@ -53,7 +56,7 @@
 #   FM_BOARD_LOOP_VALIDATION_TIMEOUT  per-lane crew-state probe bound, default 10s
 #   FM_BOARD_LOOP_HERDR_CLI           herdr client `<cli> <session> agent get <pane>`
 #   FM_BOARD_LOOP_ENDPOINT_STATUS_CMD `<cmd> <session:pane>` -> alive/dead/missing/...
-#   FM_BOARD_LOOP_PR_PROBE_CMD        `<probe> <url>` -> {"state","isDraft","headRefOid"}
+#   FM_BOARD_LOOP_PR_PROBE_CMD        optional `<probe> <url>` override for the forge read
 #   FM_BOARD_LOOP_SEND_CMD            bounded recovery steer command
 #   FM_BOARD_LOOP_STALL_SECS          stall window for an unmoved disposition, default 1800
 #   FM_BOARD_LOOP_PAUSE               set to 1 to force recovery closed
@@ -61,6 +64,7 @@
 #   FM_BOARD_LOOP_STOP_KEYS           space-separated stop keys, default operating-studio-stop
 #   FM_BOARD_LOOP_REMOTE_INVENTORY    path to a remote inventory fixture
 #   FM_LINEAR_CONFIG_FILE             narrow Linear env file (default .env.linear.local)
+#   FM_LINEAR_WRITE_API_KEY           write credential used only by `enforce`
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -91,6 +95,8 @@ REPORT_SCHEMA='fm-board-loop.v1'
 DEPLOY_WINDOW_SECS=3600
 HISTORY_RETAIN_SECS=86400
 STALL_SECS_DEFAULT=1800
+RECOVERY_RETRY_SECS=900
+RECOVERY_MAX_ATTEMPTS=3
 case "${FM_BOARD_LOOP_STALL_SECS:-}" in
   ''|*[!0-9]*) STALL_SECS=$STALL_SECS_DEFAULT ;;
   *) STALL_SECS=$FM_BOARD_LOOP_STALL_SECS ;;
@@ -101,6 +107,7 @@ usage() {
 usage: fm-board-loop.sh [scan] [--cards <file>] [--remote-inventory <file>]
        fm-board-loop.sh inventory
        fm-board-loop.sh recover [--cards <file>] [--remote-inventory <file>]
+       fm-board-loop.sh enforce [--cards <file>] [--remote-inventory <file>]
        fm-board-loop.sh pause [--reason <text>]
        fm-board-loop.sh resume
 EOF
@@ -111,6 +118,7 @@ while [ "$#" -gt 0 ]; do
     scan) MODE=scan ;;
     inventory) MODE=inventory ;;
     recover) MODE=recover ;;
+    enforce) MODE=enforce ;;
     pause) MODE=pause ;;
     resume) MODE=resume ;;
     --reason)
@@ -231,12 +239,17 @@ crew_state_line() { # <task-id>
 # An unavailable probe yields nothing, which the caller records as unknown.
 pr_probe() { # <pr-url>
   local url=$1 cmd=${FM_BOARD_LOOP_PR_PROBE_CMD:-}
-  [ -n "$cmd" ] && [ -n "$url" ] || return 1
-  # shellcheck disable=SC2086
-  $cmd "$url" 2>/dev/null
+  [ -n "$url" ] || return 1
+  if [ -n "$cmd" ]; then
+    # shellcheck disable=SC2086
+    $cmd "$url" 2>/dev/null
+    return
+  fi
+  command -v gh >/dev/null 2>&1 || return 1
+  gh pr view "$url" --json state,isDraft,headRefOid 2>/dev/null
 }
 
-# linear_cards returns a JSON array of the four active board columns, read from
+# linear_cards returns a JSON array of the five active board columns, read from
 # --cards when given, else from the narrow project-local Linear credential.
 linear_cards() {
   if [ -n "$CARDS_FILE" ]; then
@@ -264,7 +277,7 @@ linear_cards() {
   page=$(mktemp "${TMPDIR:-/tmp}/fm-board-loop.XXXXXX") || return 1
   while :; do
     payload=$(jq -cn --arg team "$team" --arg project "$project" --arg after "$cursor" '
-      {query:"query Board($team: ID!, $project: ID!, $after: String) { issues(first: 250, after: $after, filter: { team: { id: { eq: $team } }, project: { id: { eq: $project } }, state: { name: { in: [\"In Progress\", \"In Review\", \"Ready to Merge\", \"Ready to Deploy\"] } } }) { nodes { id identifier title url state { name } } pageInfo { hasNextPage endCursor } } }",
+      {query:"query Board($team: ID!, $project: ID!, $after: String) { issues(first: 250, after: $after, filter: { team: { id: { eq: $team } }, project: { id: { eq: $project } }, state: { name: { in: [\"Ready to Build\", \"In Progress\", \"In Review\", \"Ready to Merge\", \"Ready to Deploy\"] } } }) { nodes { id identifier title url state { name } } pageInfo { hasNextPage endCursor } } }",
        variables:{team:$team,project:$project,after:(if $after == "" then null else $after end)}}')
     if ! curl --fail --silent --show-error --max-time 15 \
       -H 'Content-Type: application/json' -H "Authorization: $key" \
@@ -289,6 +302,64 @@ linear_cards() {
   printf '%s\n' "$cards"
 }
 
+linear_transition() { # <issue-id> <state-name>
+  local issue=$1 state_name=$2 key team payload page state_id
+  board_loop_paused && return 1
+  key=$(fmx_env_get FM_LINEAR_WRITE_API_KEY "$LINEAR_CONFIG_FILE")
+  [ -n "$key" ] || key=${FM_LINEAR_WRITE_API_KEY:-}
+  team=$(fmx_env_get FM_LINEAR_OPERATING_STUDIO_TEAM_ID "$LINEAR_CONFIG_FILE")
+  [ -n "$team" ] || team=${FM_LINEAR_OPERATING_STUDIO_TEAM_ID:-}
+  [ -n "$key" ] && [ -n "$team" ] || return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  page=$(mktemp "${TMPDIR:-/tmp}/fm-board-loop-linear.XXXXXX") || return 1
+  payload=$(jq -cn --arg team "$team" '
+    {query:"query States($team: ID!) { workflowStates(filter:{team:{id:{eq:$team}}}) { nodes { id name } } }",
+     variables:{team:$team}}')
+  if ! curl --fail --silent --show-error --max-time 15 \
+      -H 'Content-Type: application/json' -H "Authorization: $key" \
+      --data "$payload" https://api.linear.app/graphql > "$page" 2>/dev/null; then
+    rm -f "$page"
+    return 1
+  fi
+  state_id=$(jq -r --arg name "$state_name" '
+    if (.errors // [] | length) == 0 then
+      [.data.workflowStates.nodes[] | select(.name == $name) | .id][0] // empty
+    else empty end' "$page" 2>/dev/null) || state_id=
+  [ -n "$state_id" ] || { rm -f "$page"; return 1; }
+  payload=$(jq -cn --arg issue "$issue" --arg state "$state_id" '
+    {query:"mutation Move($issue: String!, $state: String!) { issueUpdate(id:$issue,input:{stateId:$state}) { success issue { id state { name } } } }",
+     variables:{issue:$issue,state:$state}}')
+  if ! curl --fail --silent --show-error --max-time 15 \
+      -H 'Content-Type: application/json' -H "Authorization: $key" \
+      --data "$payload" https://api.linear.app/graphql > "$page" 2>/dev/null; then
+    rm -f "$page"
+    return 1
+  fi
+  if ! jq -e --arg issue "$issue" --arg state "$state_name" '
+      (.errors // [] | length) == 0 and .data.issueUpdate.success == true
+      and .data.issueUpdate.issue.id == $issue
+      and .data.issueUpdate.issue.state.name == $state' "$page" >/dev/null 2>&1; then
+    rm -f "$page"
+    return 1
+  fi
+  payload=$(jq -cn --arg issue "$issue" '
+    {query:"query Issue($issue: String!) { issue(id:$issue) { id state { name } } }",
+     variables:{issue:$issue}}')
+  if ! curl --fail --silent --show-error --max-time 15 \
+      -H 'Content-Type: application/json' -H "Authorization: $key" \
+      --data "$payload" https://api.linear.app/graphql > "$page" 2>/dev/null; then
+    rm -f "$page"
+    return 1
+  fi
+  if ! jq -e --arg issue "$issue" --arg state "$state_name" '
+      (.errors // [] | length) == 0 and .data.issue.id == $issue
+      and .data.issue.state.name == $state' "$page" >/dev/null 2>&1; then
+    rm -f "$page"
+    return 1
+  fi
+  rm -f "$page"
+}
+
 # --- herdr activity -----------------------------------------------------------
 
 # agent_status_of returns the raw Herdr agent status for a recorded endpoint as
@@ -311,13 +382,13 @@ agent_status_of() { # <session> <pane>
   esac
 }
 
-endpoint_status_of() { # <session> <pane>
-  local session=$1 pane=$2 status cmd=${FM_BOARD_LOOP_ENDPOINT_STATUS_CMD:-}
-  [ -n "$session" ] && [ -n "$pane" ] || { printf 'unavailable\n'; return 0; }
+endpoint_status_of() { # <backend> <endpoint>
+  local backend=$1 endpoint=$2 status cmd=${FM_BOARD_LOOP_ENDPOINT_STATUS_CMD:-}
+  [ -n "$backend" ] && [ -n "$endpoint" ] || { printf 'unavailable\n'; return 0; }
   if [ -n "$cmd" ]; then
-    status=$("$cmd" "$session:$pane" 2>/dev/null) || status=unreadable
+    status=$("$cmd" "$endpoint" 2>/dev/null) || status=unreadable
   else
-    status=$(fm_backend_agent_state herdr "$session:$pane" 2>/dev/null) || status=unreadable
+    status=$(fm_backend_agent_state "$backend" "$endpoint" 2>/dev/null) || status=unreadable
   fi
   case "$status" in
     alive|dead|missing|ambiguous|unreadable|unverified) printf '%s\n' "$status" ;;
@@ -361,6 +432,16 @@ validation_of() { # <task-id>
   esac
 }
 
+agent_status_from_validation() { # <validation>
+  case "$1" in
+    running) printf 'working\n' ;;
+    green) printf 'done\n' ;;
+    blocked) printf 'blocked\n' ;;
+    gate-waiting|waiting) printf 'idle\n' ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
 # prepare_validations probes every recorded non-secondmate task's live
 # validation/run disposition in parallel, bounded by VALIDATION_TIMEOUT each, so
 # a wall of lanes can never serialize a slow crew-state read into the scan.
@@ -383,7 +464,8 @@ prepare_validations() {
     count=$((count + 1))
     (
       v=$(validation_of "$id") || v=unknown
-      printf '%s\t%s\n' "$id" "$v" >> "$out"
+      if [ "$v" = unknown ]; then source=unavailable; else source=available; fi
+      printf '%s\t%s\t%s\n' "$id" "$v" "$source" >> "$out"
     ) &
     pids="$pids $!"
   done < "$ids"
@@ -403,32 +485,28 @@ validation_lookup() { # <task-id>
     "$VALIDATION_MAP" 2>/dev/null || printf 'unknown\n'
 }
 
+validation_source_lookup() { # <task-id>
+  local id=$1
+  [ -n "$VALIDATION_MAP" ] && [ -f "$VALIDATION_MAP" ] || { printf 'unavailable\n'; return 0; }
+  awk -F'\t' -v id="$id" '$1 == id { print $3; found=1; exit } END { if (!found) print "unavailable" }' \
+    "$VALIDATION_MAP" 2>/dev/null || printf 'unavailable\n'
+}
+
 # --- decision ledger ----------------------------------------------------------
 
-# decision_state_of prints one TSV row per still-open decision key:
-#   <key>\t<verb>\t<delivered>\t<acknowledged>\t<ring-attempts>
-# `delivered` is an inbox record; an acknowledged record is one in handled/.
+# decision_state_of prints one TSV row per open or durably answered decision:
+#   <key>\t<verb>\t<delivered>\t<acknowledged>\t<ring-attempts>\t<progressed>
+# Answer records bind the exact key to the exact inbox record and status offset.
 # Delivery is never completion: a decision is consumed only once the worker
 # also reaches a productive or terminal disposition.
 decision_state_of() { # <task-id>
   local id=$1
-  local status="$STATE/$id.status" inbox="$STATE/$id.inbox"
-  local key verb note delivered handed attempts f line msg count
+  local status="$STATE/$id.status" inbox="$STATE/$id.inbox" records="$STATE/$id.decision-deliveries"
+  local key verb note delivered handed attempts f line msg count record basename baseline size progressed
   while IFS=$'\t' read -r key verb note || [ -n "${key:-}" ]; do
     [ -n "$key" ] || continue
     delivered=0
     handed=0
-    if [ -d "$inbox" ] && [ ! -L "$inbox" ]; then
-      for f in "$inbox"/*.msg; do
-        [ -f "$f" ] && [ ! -L "$f" ] || continue
-        delivered=1
-      done
-      for f in "$inbox/handled"/*.msg; do
-        [ -f "$f" ] && [ ! -L "$f" ] || continue
-        delivered=1
-        handed=1
-      done
-    fi
     attempts=0
     if [ -f "$inbox/.ring-state" ] && [ ! -L "$inbox/.ring-state" ]; then
       line=$(sed -n '/./{p;q;}' "$inbox/.ring-state" 2>/dev/null) || line=
@@ -439,34 +517,72 @@ decision_state_of() { # <task-id>
       attempts=$count
       [ -n "$msg" ] || attempts=$count
     fi
-    printf '%s\t%s\t%s\t%s\t%s\n' "$key" "$verb" "$delivered" "$handed" "$attempts"
+    printf '%s\t%s\t%s\t%s\t%s\t0\n' "$key" "$verb" "$delivered" "$handed" "$attempts"
   done < <(status_open_decisions "$status" 2>/dev/null || true)
+  if [ -d "$records" ] && [ ! -L "$records" ]; then
+    for record in "$records"/*.record; do
+      [ -f "$record" ] && [ ! -L "$record" ] || continue
+      key=$(sed -n 's/^key=//p' "$record" | sed -n '/./{p;q;}')
+      basename=$(sed -n 's/^inbox_record=//p' "$record" | sed -n '/./{p;q;}')
+      baseline=$(sed -n 's/^status_size=//p' "$record" | sed -n '/./{p;q;}')
+      case "$key" in ''|*[!A-Za-z0-9._-]*) continue ;; esac
+      case "$basename" in ''|*/*|.*|*[!A-Za-z0-9._-]*) continue ;; esac
+      case "$baseline" in ''|*[!0-9]*) baseline=0 ;; esac
+      delivered=0
+      handed=0
+      if [ -f "$inbox/$basename" ] && [ ! -L "$inbox/$basename" ]; then delivered=1; fi
+      if [ -f "$inbox/handled/$basename" ] && [ ! -L "$inbox/handled/$basename" ]; then
+        delivered=1
+        handed=1
+      fi
+      if [ -f "$status" ] && [ ! -L "$status" ]; then
+        size=$(wc -c < "$status" 2>/dev/null | tr -d '[:space:]')
+      else
+        size=0
+      fi
+      case "$size" in ''|*[!0-9]*) size=0 ;; esac
+      progressed=0
+      [ "$size" -le "$baseline" ] || progressed=1
+      attempts=0
+      if [ "$delivered" -eq 1 ] && [ "$handed" -eq 0 ] && [ -f "$inbox/.ring-state" ]; then
+        line=$(sed -n '/./{p;q;}' "$inbox/.ring-state" 2>/dev/null) || line=
+        msg=${line%%$'\t'*}
+        count=${line#*$'\t'}; count=${count%%$'\t'*}
+        [ "$msg" = "$basename" ] || count=0
+        case "$count" in ''|*[!0-9]*) count=0 ;; esac
+        attempts=$count
+      fi
+      printf '%s\tanswered\t%s\t%s\t%s\t%s\n' "$key" "$delivered" "$handed" "$attempts" "$progressed"
+    done
+  fi
 }
 
 # --- lane and decision collection ---------------------------------------------
 
-lane_json() { # <task-id> <kind> <backend> <endpoint> <card> <agent> <endpoint-status> \
-             # <disposition> <validation> <terminal-bool> <pr> <pr-head> \
-             # <pr-state> <pr-draft-bool> <pr-head-live> <status-verb> <status-size>
+lane_json() { # lane fields followed by agent/validation/forge source health
   jq -cn \
     --arg task_id "$1" --arg kind "$2" --arg backend "$3" --arg endpoint "$4" \
     --arg linear_card_id "$5" --arg agent_status "$6" --arg endpoint_status "$7" \
     --arg disposition "$8" --arg validation "$9" --argjson terminal "${10}" \
     --arg pr "${11}" --arg pr_head "${12}" --arg pr_state "${13}" \
     --argjson pr_draft "${14}" --arg pr_head_live "${15}" --arg status_verb "${16}" \
-    --argjson status_size "${17}" \
+    --argjson status_size "${17}" --arg agent_source "${18}" \
+    --arg validation_source "${19}" --arg forge_source "${20}" \
     '{task_id:$task_id, kind:$kind, backend:$backend, endpoint:$endpoint,
       linear_card_id:$linear_card_id, agent_status:$agent_status,
       endpoint_status:$endpoint_status, disposition:$disposition,
       validation:$validation, terminal:$terminal, pr:$pr, pr_head:$pr_head,
       pr_state:$pr_state, pr_draft:$pr_draft, pr_head_live:$pr_head_live,
-      status_verb:$status_verb, status_size:$status_size}'
+      status_verb:$status_verb, status_size:$status_size,
+      agent_source:$agent_source, validation_source:$validation_source,
+      forge_source:$forge_source}'
 }
 
 collect_lanes() { # -> JSON array
   local meta id kind backend endpoint card session pane agent endstat
   local status verb disposition validation terminal pr pr_head
-  local pr_state pr_draft pr_head_live out lines=() status_size
+  local pr_state pr_draft pr_head_live out lines=() status_size validation_source
+  local agent_source forge_source
   [ -d "$STATE" ] && [ ! -L "$STATE" ] || { printf '[]\n'; return 0; }
   for meta in "$STATE"/*.meta; do
     [ -f "$meta" ] && [ ! -L "$meta" ] || continue
@@ -482,12 +598,16 @@ collect_lanes() { # -> JSON array
     terminal=$(fm_meta_get "$meta" terminal)
     session=$(fm_meta_get "$meta" herdr_session)
     pane=$(fm_meta_get "$meta" herdr_pane_id)
+    validation=$(validation_lookup "$id")
+    validation_source=$(validation_source_lookup "$id")
     if [ "$backend" = herdr ] && [ -n "$session" ] && [ -n "$pane" ] && [ "$endpoint" = "$session:$pane" ]; then
       agent=$(agent_status_of "$session" "$pane")
-      endstat=$(endpoint_status_of "$session" "$pane")
+      endstat=$(endpoint_status_of "$backend" "$endpoint")
+      case "$agent" in unavailable|unknown) agent_source=unavailable ;; *) agent_source=available ;; esac
     else
-      agent=unavailable
-      endstat=not-applicable
+      agent=$(agent_status_from_validation "$validation")
+      endstat=$(endpoint_status_of "$backend" "$endpoint")
+      agent_source=$validation_source
     fi
     verb=$(status_current_line "$STATE/$id.status" "$kind" 2>/dev/null) || verb=
     verb=${verb%% *}
@@ -497,16 +617,19 @@ collect_lanes() { # -> JSON array
     else
       disposition=$(disposition_of "$verb" "$agent")
     fi
-    validation=$(validation_lookup "$id")
     pr_state=unknown
     pr_draft=false
     pr_head_live=
+    forge_source=not-required
     if [ -n "$pr" ]; then
       out=$(pr_probe "$pr") || out=
       if [ -n "$out" ]; then
         pr_state=$(printf '%s' "$out" | jq -r '.state // "unknown"' 2>/dev/null) || pr_state=unknown
         pr_draft=$(printf '%s' "$out" | jq -r '.isDraft // false' 2>/dev/null) || pr_draft=false
         pr_head_live=$(printf '%s' "$out" | jq -r '.headRefOid // ""' 2>/dev/null) || pr_head_live=
+        if [ "$pr_state" = unknown ]; then forge_source=unavailable; else forge_source=available; fi
+      else
+        forge_source=unavailable
       fi
     fi
     case "$pr_draft" in true|false) ;; *) pr_draft=false ;; esac
@@ -518,10 +641,12 @@ collect_lanes() { # -> JSON array
     case "$status_size" in ''|*[!0-9]*) status_size=0 ;; esac
     if [ "$terminal" = 1 ]; then
       lines+=("$(lane_json "$id" "$kind" "$backend" "$endpoint" "$card" "$agent" "$endstat" \
-        "$disposition" "$validation" true "$pr" "$pr_head" "$pr_state" "$pr_draft" "$pr_head_live" "$verb" "$status_size")")
+        "$disposition" "$validation" true "$pr" "$pr_head" "$pr_state" "$pr_draft" "$pr_head_live" "$verb" "$status_size" \
+        "$agent_source" "$validation_source" "$forge_source")")
     else
       lines+=("$(lane_json "$id" "$kind" "$backend" "$endpoint" "$card" "$agent" "$endstat" \
-        "$disposition" "$validation" false "$pr" "$pr_head" "$pr_state" "$pr_draft" "$pr_head_live" "$verb" "$status_size")")
+        "$disposition" "$validation" false "$pr" "$pr_head" "$pr_state" "$pr_draft" "$pr_head_live" "$verb" "$status_size" \
+        "$agent_source" "$validation_source" "$forge_source")")
     fi
   done
   [ "${#lines[@]}" -gt 0 ] || { printf '[]\n'; return 0; }
@@ -535,27 +660,43 @@ collect_decisions() { # -> JSON array
     [ -f "$meta" ] && [ ! -L "$meta" ] || continue
     id=${meta##*/}; id=${id%.meta}
     task_id_valid "$id" || continue
-    while IFS=$'\t' read -r key verb delivered handed attempts; do
+    while IFS=$'\t' read -r key verb delivered handed attempts progressed; do
       [ -n "$key" ] || continue
       lines+=("$(jq -cn --arg task_id "$id" --arg key "$key" --arg verb "$verb" \
         --argjson delivered "$delivered" --argjson acknowledged "$handed" \
-        --argjson ring_attempts "$attempts" \
+        --argjson ring_attempts "$attempts" --argjson progressed "$progressed" \
         '{task_id:$task_id, key:$key, verb:$verb, delivered:$delivered,
-          acknowledged:$acknowledged, ring_attempts:$ring_attempts}')")
+          acknowledged:$acknowledged, ring_attempts:$ring_attempts,
+          progressed:$progressed}')")
     done < <(decision_state_of "$id")
   done
   [ "${#lines[@]}" -gt 0 ] || { printf '[]\n'; return 0; }
   printf '%s\n' "${lines[@]}" | jq -cs '.'
 }
 
-collect_remote() { # -> JSON array of remote inventories
+collect_remote() { # -> health envelope with inventories and merged lanes
   local file=${REMOTE_FILE:-${FM_BOARD_LOOP_REMOTE_INVENTORY:-}}
   if [ -n "$file" ]; then
-    [ -f "$file" ] && [ ! -L "$file" ] || { printf '[]\n'; return 0; }
-    jq -c 'if type == "array" then . else [.] end' "$file" 2>/dev/null || printf '[]\n'
+    [ -f "$file" ] && [ ! -L "$file" ] || {
+      printf '{"status":"unavailable","inventories":[],"lanes":[]}\n'; return 0;
+    }
+    jq -ce '
+      (if type == "array" then . else [.] end) as $inventories
+      | if all($inventories[]; .schema == "fm-board-inventory.v1" and (.lanes | type) == "array")
+          and all($inventories[].lanes[];
+            (.task_id | type) == "string" and (.linear_card_id | type) == "string"
+            and (.backend | type) == "string" and (.endpoint | type) == "string"
+            and (.agent_status | type) == "string" and (.endpoint_status | type) == "string"
+            and (.disposition | type) == "string" and (.validation | type) == "string"
+            and (.agent_source | type) == "string" and (.validation_source | type) == "string"
+            and (.forge_source | type) == "string")
+        then {status:"available", inventories:$inventories,
+              lanes:[$inventories[].lanes[]]}
+        else error("invalid remote inventory") end' "$file" 2>/dev/null \
+      || printf '{"status":"unavailable","inventories":[],"lanes":[]}\n'
     return 0
   fi
-  printf '[]\n'
+  printf '{"status":"not-configured","inventories":[],"lanes":[]}\n'
 }
 
 # --- deployment ledger --------------------------------------------------------
@@ -644,7 +785,7 @@ emit_inventory() {
 
 # --- classification -----------------------------------------------------------
 
-classify() { # <cards-json> <lanes-json> <decisions-json> <remote-json> <history-json> <prev-lanes-json> <paused> <pause-reason>
+classify() { # cards, lanes, decisions, remote envelope, history, previous lanes, paused, reason, sources
   jq -n \
     --argjson now "$NOW" \
     --argjson window "$DEPLOY_WINDOW_SECS" \
@@ -657,10 +798,12 @@ classify() { # <cards-json> <lanes-json> <decisions-json> <remote-json> <history
     --argjson prev "$6" \
     --argjson paused "$7" \
     --arg pause_reason "$8" \
+    --argjson sources "$9" \
     --arg schema "$REPORT_SCHEMA" '
-    def active: . == "In Progress" or . == "In Review" or . == "Ready to Merge";
+    def active: . == "Ready to Build" or . == "In Progress" or . == "In Review" or . == "Ready to Merge";
     def productive:
-      .agent_status == "working"
+      .agent_status == "working" and .endpoint_status == "alive"
+      and .agent_source == "available" and .validation_source == "available"
       and (.disposition != "terminal" and .disposition != "done"
            and .disposition != "parked" and .disposition != "paused"
            and .disposition != "blocked")
@@ -688,26 +831,33 @@ classify() { # <cards-json> <lanes-json> <decisions-json> <remote-json> <history
              detail:("multiple workers claim this card: " + ($owners | map(.task_id) | join(","))),
              recovery:{kind:"escalate", target:null, reason:"resolve the duplicate card ownership"}}
           else $owners[0] as $l
-            | if ($l.pr_head != "" and $l.pr_head_live != "" and $l.pr_head != $l.pr_head_live
-                  and $l.pr_state == "OPEN") then
+            | if ($l.pr_head != "" and $l.pr_head_live != "" and $l.pr_head != $l.pr_head_live) then
                 {kind:"head-drift", task_id:$l.task_id, card_id:$c.id, identifier:$c.identifier,
                  card_state:$c.state,
                  detail:("recorded PR head " + $l.pr_head + " differs from the live head " + $l.pr_head_live),
                  recovery:{kind:"escalate", target:$l.task_id,
                    reason:"re-verify the exact PR head before any landing decision"}}
+              elif $l.pr != "" and ($l.pr_head == "" or $l.pr_head_live == "") then
+                {kind:"pr-head-unverified", task_id:$l.task_id, card_id:$c.id,
+                 identifier:$c.identifier, card_state:$c.state,
+                 detail:"the canonical PR does not have matching recorded and live head evidence",
+                 recovery:{kind:"escalate", target:$l.task_id,
+                   reason:"record and verify the exact PR head before changing the card state"}}
               elif $c.state == "In Review" and $l.pr == "" then
                 {kind:"in-review-without-pr", task_id:$l.task_id, card_id:$c.id,
                  identifier:$c.identifier, card_state:$c.state,
                  detail:"card is In Review but the worker records no PR",
                  recovery:{kind:"steer", target:$l.task_id,
                    reason:"attach the canonical PR URL or move the card back to In Progress"}}
-              elif $c.state == "Ready to Merge" and $l.pr_state != "MERGED" then
+              elif $c.state == "Ready to Merge" and ($l.pr_state != "MERGED"
+                   or $l.pr_head_live != $l.pr_head) then
                 {kind:"ready-to-merge-unlanded", task_id:$l.task_id, card_id:$c.id,
                  identifier:$c.identifier, card_state:$c.state,
                  detail:"reviewed candidate is Ready to Merge but not landed",
                  recovery:{kind:"escalate", target:$l.task_id,
                    reason:"land the reviewed candidate serially and verify the readback"}}
-              elif $c.state == "Ready to Deploy" and $l.pr_state != "MERGED" then
+              elif $c.state == "Ready to Deploy" and ($l.pr_state != "MERGED"
+                   or $l.pr_head_live != $l.pr_head) then
                 {kind:"ready-to-deploy-unverified", task_id:$l.task_id, card_id:$c.id,
                  identifier:$c.identifier, card_state:$c.state,
                  detail:"card is Ready to Deploy without a merged canonical PR",
@@ -754,8 +904,10 @@ classify() { # <cards-json> <lanes-json> <decisions-json> <remote-json> <history
                  detail:"worker is idle/done with unresolved In Progress work",
                  recovery:{kind:"steer", target:$l.task_id,
                    reason:"resume or hand off the card; your agent is idle"}}
-              elif (($l.agent_status == "unavailable" or $l.endpoint_status == "missing"
-                    or $l.endpoint_status == "dead")
+              elif (($l.agent_status == "unavailable" or $l.agent_status == "unknown"
+                    or $l.endpoint_status == "missing" or $l.endpoint_status == "dead"
+                    or $l.endpoint_status == "unreadable" or $l.endpoint_status == "unverified"
+                    or $l.endpoint_status == "unavailable")
                     and ($c.state | active)) then
                 {kind:"endpoint-unavailable", task_id:$l.task_id, card_id:$c.id,
                  identifier:$c.identifier, card_state:$c.state,
@@ -794,7 +946,9 @@ classify() { # <cards-json> <lanes-json> <decisions-json> <remote-json> <history
              identifier:null, detail:"decision delivered but the worker has not acknowledged it",
              recovery:{kind:"steer", target:$d.task_id,
                reason:("acknowledge and consume decision key " + $d.key)}}
-          elif $l != null and ($l.disposition != "working" and $l.disposition != "terminal")
+          elif $d.acknowledged == 1 and $l != null
+               and $l.disposition != "terminal"
+               and (($d.progressed == 1 and $l.disposition == "working") | not)
                and ($l.card_state != null) and ($l.card_state | active) then
             {kind:"decision-unconsumed", task_id:$d.task_id, card_id:$l.linear_card_id,
              identifier:$l.card_identifier, detail:"decision acknowledged but the lane never reached a productive disposition",
@@ -809,7 +963,7 @@ classify() { # <cards-json> <lanes-json> <decisions-json> <remote-json> <history
            recovery:{kind:"escalate", target:$l.task_id,
              reason:"record the immutable Linear card id for this worker"}}
       ] as $unbound_causes
-    | [ $remote[] as $inv
+    | [ $remote.inventories[] as $inv
         | {kind:"remote-inventory", home:($inv.home // ""),
            lanes:(($inv.lanes // []) | length), detail:"remote inventory included"} ] as $remote_rows
     | ([ $history[] | select((.ts | type) == "number" and ($now - .ts) <= $window) ] | length) as $landed
@@ -817,7 +971,39 @@ classify() { # <cards-json> <lanes-json> <decisions-json> <remote-json> <history
     | ([ $joined[] | select(.card_state != null and (.card_state | active)
           and .disposition != "terminal") ] | length) as $eligible_active
     | ([ $cards[] | select(.state == "Ready to Deploy") ] | length) as $rtd
-    | (($card_causes + $decision_causes + $unbound_causes)) as $causes
+    | ([
+        if $sources.linear == "unavailable" then
+          {kind:"source-unavailable", task_id:null, card_id:null, identifier:null,
+           detail:"Linear board input is unavailable",
+           recovery:{kind:"escalate",target:null,reason:"restore Linear board access"}}
+        else empty end,
+        if $sources.remote == "unavailable" then
+          {kind:"source-unavailable", task_id:null, card_id:null, identifier:null,
+           detail:"remote lane inventory is unavailable or invalid",
+           recovery:{kind:"escalate",target:null,reason:"restore the remote inventory feed"}}
+        else empty end,
+        if $sources.linear_write == "unavailable" then
+          {kind:"source-unavailable", task_id:null, card_id:null, identifier:null,
+           detail:"Linear write access is unavailable for enforcement",
+           recovery:{kind:"escalate",target:null,reason:"configure the board owner Linear write credential"}}
+        else empty end,
+        if any($joined[]; .validation_source == "unavailable") then
+          {kind:"source-unavailable", task_id:null, card_id:null, identifier:null,
+           detail:"crew-state validation is unavailable for one or more lanes",
+           recovery:{kind:"escalate",target:null,reason:"restore crew-state validation"}}
+        else empty end,
+        if any($joined[]; .agent_source == "unavailable") then
+          {kind:"source-unavailable", task_id:null, card_id:null, identifier:null,
+           detail:"agent-state evidence is unavailable for one or more lanes",
+           recovery:{kind:"escalate",target:null,reason:"restore the backend agent-state reader"}}
+        else empty end,
+        if any($joined[]; .forge_source == "unavailable") then
+          {kind:"source-unavailable", task_id:null, card_id:null, identifier:null,
+           detail:"forge evidence is unavailable for one or more recorded PRs",
+           recovery:{kind:"escalate",target:null,reason:"restore the canonical PR probe"}}
+        else empty end
+      ]) as $source_causes
+    | (($card_causes + $decision_causes + $unbound_causes + $source_causes)) as $causes
     | {
         schema:$schema,
         generated_at:$now,
@@ -831,32 +1017,64 @@ classify() { # <cards-json> <lanes-json> <decisions-json> <remote-json> <history
           fault:(($landed == 0 and $eligible_active > 0) and ($paused | not))},
         paused:$paused,
         pause_reason:$pause_reason,
+        sources:$sources,
         decisions:($decisions),
         remote:($remote_rows),
         summary:{cards:($cards | length), causes:($causes | length),
           end_to_end_fault:((($landed == 0 and $eligible_active > 0) and ($paused | not))
-            or any($causes[]; .kind == "endpoint-unavailable"))}
+            or any($causes[]; .kind == "endpoint-unavailable" or .kind == "source-unavailable"))}
       }'
 }
 
 # --- recover ------------------------------------------------------------------
 
-# recover_target steers one task through the durable inbox, at most once per
-# (task, reason) signature so a periodic pass never spams a lane. The marker
-# ledger is the idempotence guard; a failed send is retried on the next pass.
+# Recovery retries one still-present cause at most three times, no faster than
+# the board cadence. The ledger drops a signature as soon as its cause clears,
+# so a later recurrence gets a fresh bounded retry ladder.
+recovery_signature() {
+  local sig
+  sig=$(printf '%s' "$1" | shasum 2>/dev/null | cut -d' ' -f1)
+  [ -n "$sig" ] || sig=$(printf '%s' "$1" | cksum 2>/dev/null | awk '{print $1}')
+  printf '%s' "$sig"
+}
+
+recovery_ledger_sync() { # <active task/reason TSV on stdin>
+  local active="$TMP/recovery-active.tsv" tmp id reason sig
+  : > "$active"
+  while IFS=$'\t' read -r id reason; do
+    [ -n "$id" ] || continue
+    sig=$(recovery_signature "$reason")
+    [ -n "$sig" ] || continue
+    printf '%s\t%s\n' "$id" "$sig" >> "$active"
+  done
+  [ -f "$RECOVERY_LEDGER" ] && [ ! -L "$RECOVERY_LEDGER" ] || { : > "$RECOVERY_LEDGER"; return 0; }
+  tmp=$(mktemp "$STATE/.board-loop-recovery.XXXXXX") || return 1
+  awk -F'\t' 'NR==FNR { active[$1 FS $2]=1; next }
+    active[$1 FS $2] { print }' "$active" "$RECOVERY_LEDGER" > "$tmp" \
+    && mv -f "$tmp" "$RECOVERY_LEDGER" || { rm -f "$tmp"; return 1; }
+}
+
 recover_target() { # <task-id> <reason>
   local id=$1 reason=$2 sig send_cmd=${FM_BOARD_LOOP_SEND_CMD:-$SCRIPT_DIR/fm-send.sh}
+  local row attempts last tmp
+  board_loop_paused && return 1
   task_id_valid "$id" || return 1
-  sig=$(printf '%s' "$reason" | shasum 2>/dev/null | cut -d' ' -f1)
-  [ -n "$sig" ] || sig=$(printf '%s' "$reason" | cksum 2>/dev/null | awk '{print $1}')
+  sig=$(recovery_signature "$reason")
   [ -n "$sig" ] || return 1
-  if [ -f "$RECOVERY_LEDGER" ] && [ ! -L "$RECOVERY_LEDGER" ] \
-    && awk -F'\t' -v id="$id" -v sig="$sig" '$1 == id && $2 == sig { found=1 } END { exit found ? 0 : 1 }' \
-      "$RECOVERY_LEDGER" 2>/dev/null; then
-    return 0
-  fi
+  row=$(awk -F'\t' -v id="$id" -v sig="$sig" '$1 == id && $2 == sig { print; exit }' \
+    "$RECOVERY_LEDGER" 2>/dev/null) || row=
+  attempts=$(printf '%s' "$row" | awk -F'\t' '{print $3}')
+  last=$(printf '%s' "$row" | awk -F'\t' '{print $4}')
+  case "$attempts" in ''|*[!0-9]*) attempts=0 ;; esac
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ "$attempts" -lt "$RECOVERY_MAX_ATTEMPTS" ] || return 0
+  [ $((NOW - last)) -ge "$RECOVERY_RETRY_SECS" ] || return 0
   if FM_HOME="$FM_HOME" $send_cmd "$id" "$reason" >/dev/null 2>&1; then
-    printf '%s\t%s\t%s\n' "$id" "$sig" "$NOW" >> "$RECOVERY_LEDGER" 2>/dev/null || true
+    tmp=$(mktemp "$STATE/.board-loop-recovery.XXXXXX") || return 1
+    awk -F'\t' -v id="$id" -v sig="$sig" '!($1 == id && $2 == sig)' \
+      "$RECOVERY_LEDGER" > "$tmp" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\n' "$id" "$sig" "$((attempts + 1))" "$NOW" >> "$tmp" \
+      && mv -f "$tmp" "$RECOVERY_LEDGER" || { rm -f "$tmp"; return 1; }
     return 0
   fi
   return 1
@@ -868,13 +1086,28 @@ case "$MODE" in
   inventory)
     emit_inventory
     ;;
-  scan|recover)
+  scan|recover|enforce)
     history_prune
-    CARDS=$(linear_cards) || CARDS='[]'
+    if CARDS=$(linear_cards); then LINEAR_HEALTH=available; else CARDS='[]'; LINEAR_HEALTH=unavailable; fi
     prepare_validations
-    LANES=$(collect_lanes)
+    LOCAL_LANES=$(collect_lanes)
     DECISIONS=$(collect_decisions)
     REMOTE=$(collect_remote)
+    LANES=$(jq -cn --argjson local "$LOCAL_LANES" --argjson remote "$REMOTE" \
+      '$local + $remote.lanes')
+    WRITE_HEALTH=not-required
+    if [ "$MODE" = enforce ]; then
+      WRITE_KEY=$(fmx_env_get FM_LINEAR_WRITE_API_KEY "$LINEAR_CONFIG_FILE")
+      [ -n "$WRITE_KEY" ] || WRITE_KEY=${FM_LINEAR_WRITE_API_KEY:-}
+      if [ -n "$WRITE_KEY" ] && command -v curl >/dev/null 2>&1; then
+        WRITE_HEALTH=available
+      else
+        WRITE_HEALTH=unavailable
+      fi
+    fi
+    SOURCES=$(jq -cn --arg linear "$LINEAR_HEALTH" --arg linear_write "$WRITE_HEALTH" \
+      --arg remote "$(printf '%s' "$REMOTE" | jq -r '.status')" \
+      '{linear:$linear,linear_write:$linear_write,remote:$remote}')
 
     # Record newly verified Ready to Deploy cards before the throughput read so
     # this pass's own verified landings count inside the rolling hour.
@@ -885,28 +1118,52 @@ case "$MODE" in
       .[] as $c
       | select($c.state == "Ready to Deploy")
       | ($lanes | map(select(.linear_card_id == $c.id and .pr != ""
-          and .pr_state == "MERGED")) | .[0]) as $l
+          and .pr_state == "MERGED" and .pr_head != ""
+          and .pr_head_live == .pr_head)) | .[0]) as $l
       | select($l != null)
-      | [$c.id, $l.pr, ($l.pr_head_live // $l.pr_head)] | @tsv
+      | [$c.id, $l.pr, $l.pr_head_live] | @tsv
     ' < <(printf '%s' "$CARDS") 2>/dev/null || true)
     history_prune
 
     PREV_LANES=$(lane_history_json)
     if board_loop_paused; then PAUSED=true; else PAUSED=false; fi
     PAUSE_REASON=$(board_loop_pause_reason)
-    REPORT=$(classify "$CARDS" "$LANES" "$DECISIONS" "$REMOTE" "$(history_json)" "$PREV_LANES" "$PAUSED" "$PAUSE_REASON")
+    REPORT=$(classify "$CARDS" "$LANES" "$DECISIONS" "$REMOTE" "$(history_json)" "$PREV_LANES" "$PAUSED" "$PAUSE_REASON" "$SOURCES")
     printf '%s' "$REPORT" | lane_history_write
 
     if [ "$MODE" = recover ]; then
       if board_loop_paused; then
         printf 'fm-board-loop: recovery is paused; no recovery steer was sent\n' >&2
       else
+        printf '%s' "$REPORT" | jq -r '
+          .causes[] | select(.recovery.kind == "steer")
+          | [.recovery.target, (.recovery.reason // .detail)] | @tsv' \
+          | recovery_ledger_sync
         while IFS=$'\t' read -r target reason; do
           [ -n "$target" ] || continue
           recover_target "$target" "$reason" || true
         done < <(printf '%s' "$REPORT" | jq -r '
           .causes[] | select(.recovery.kind == "steer")
           | [.recovery.target, (.recovery.reason // .detail)] | @tsv')
+      fi
+    fi
+    if [ "$MODE" = enforce ]; then
+      if board_loop_paused; then
+        printf 'fm-board-loop: enforcement is paused; no Linear transition was sent\n' >&2
+      elif [ "$LINEAR_HEALTH" = available ]; then
+        while IFS=$'\t' read -r card state; do
+          [ -n "$card" ] || continue
+          linear_transition "$card" "$state" || true
+        done < <(printf '%s' "$REPORT" | jq -r '
+          .causes[] | select(.kind == "green-pr-not-in-review")
+          | [.card_id, "In Review"] | @tsv')
+        while IFS=$'\t' read -r card state; do
+          [ -n "$card" ] || continue
+          linear_transition "$card" "$state" || true
+        done < <(printf '%s' "$REPORT" | jq -r '
+          .lanes[] | select(.card_state == "Ready to Merge" and .pr_state == "MERGED"
+            and .pr_head != "" and .pr_head_live == .pr_head)
+          | [.linear_card_id, "Ready to Deploy"] | @tsv')
       fi
     fi
     printf '%s\n' "$REPORT"

@@ -10,6 +10,7 @@ scratchpad*
 __pycache__/
 *.pyc
 .env
+.env.linear.local
 config/
 
 .tools/

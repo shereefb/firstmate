@@ -727,6 +727,37 @@ fm_send_close_resolved_keys() { # <answer-text>
   done
 }
 
+fm_send_record_decision_delivery() { # <inbox-record>
+  local inbox_record=$1 basename dir key size tmp
+  [ -n "$RESOLVE_STATUS_KEYS" ] || return 0
+  basename=${inbox_record##*/}
+  case "$basename" in ''|*/*|.*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  if [ -f "$RESOLVE_STATUS_FILE" ] && [ ! -L "$RESOLVE_STATUS_FILE" ]; then
+    size=$(LC_ALL=C awk -v keys=" $RESOLVE_STATUS_KEYS " '
+      BEGIN { count=split(keys, wanted, " ") }
+      { bytes += length($0) + 1
+        for (i=1; i<=count; i++)
+          if (wanted[i] != "" && index($0, "resolved [key=" wanted[i] "]") > 0) end=bytes }
+      END { print end + 0 }' "$RESOLVE_STATUS_FILE" 2>/dev/null)
+  else
+    size=0
+  fi
+  case "$size" in ''|*[!0-9]*) size=0 ;; esac
+  dir="$STATE/$RESOLVE_TASK_ID.decision-deliveries"
+  mkdir -p "$dir" || return 1
+  [ ! -L "$dir" ] || return 1
+  for key in $RESOLVE_STATUS_KEYS; do
+    tmp=$(umask 077; mktemp "$dir/.delivery.XXXXXX") || return 1
+    if ! printf 'schema=fm-decision-delivery.v1\nkey=%s\ninbox_record=%s\nstatus_size=%s\n' \
+        "$key" "$basename" "$size" > "$tmp" \
+      || ! chmod 0600 "$tmp" \
+      || ! mv -f "$tmp" "$dir/$key.record"; then
+      rm -f "$tmp"
+      return 1
+    fi
+  done
+}
+
 # Feed the answered captain-held tasks to the ONE keyed-answer intake, as keyed
 # lines, exactly the way every other channel does. fm-send decides nothing here:
 # it does not build a decision record or choose a close path; the keys were
@@ -1077,6 +1108,10 @@ else
     # (answerer-closes; see the header contract).
     if [ -n "$RESOLVE_KEYS" ]; then
       fm_send_close_resolved_keys "$RESOLVE_ANSWER_TEXT" || exit 1
+      fm_send_record_decision_delivery "$INBOX_RECORD" || {
+        echo "error: the answer was delivered and the decision closed, but its acknowledgement record could not be written; do not resend" >&2
+        exit 1
+      }
       fm_send_feed_resolved_holds "$RESOLVE_ANSWER_TEXT" || exit 1
     fi
     # Ring the doorbell, best-effort: no ring outcome changes the exit status,
