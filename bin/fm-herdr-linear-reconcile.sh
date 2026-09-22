@@ -38,7 +38,7 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 
 MODE=compare
 LINEAR_API=0
-ZEUS_ID=${FM_LINEAR_ZEUS_ROUTE_ID:-zeus}
+ZEUS_ID=${FM_LINEAR_ZEUS_ROUTE_ID:-zues}
 
 usage() {
   cat <<'EOF'

@@ -173,7 +173,7 @@ parent_home=$dir/parent
 EOF
   write_owner_meta "$dir/parent/state/buildboard.meta" buildboard "$dir/home" jarvis w-owned t-launch p-launch
   printf '%s\n' \
-    '- zeus - Operating Studio delivery (host: zeus-host; root: /remote/firstmate; home: /remote/zeus-home; scope: Operating Studio delivery; projects: operating-studio; added 2026-09-22)' \
+    '- zues - Operating Studio delivery (host: zeus-host; root: /remote/firstmate; home: /remote/zeus-home; scope: Operating Studio delivery; projects: operating-studio; added 2026-09-22)' \
     '- other - Other delivery (host: zeus-host; root: /remote/firstmate; home: /remote/other-home; scope: Other delivery; projects: other; added 2026-09-22)' \
     > "$dir/home/data/secondmates.md"
   printf '%s\n' '{"schema":"fm-herdr-linear-inventory.v1","home":"/remote/zeus-home","ownership_status":"verified","children":[]}' > "$dir/zeus-live.json"
@@ -347,10 +347,10 @@ test_registered_remote_route_id_is_configurable() {
   dir=$(make_case configured-remote-route)
   cards="$dir/cards.json"
   printf '%s\n' '{"cards":[]}' > "$cards"
-  sed 's/^- zeus /- zues /' "$dir/home/data/secondmates.md" > "$dir/home/data/secondmates.next.md"
+  sed 's/^- zues /- zeus /' "$dir/home/data/secondmates.md" > "$dir/home/data/secondmates.next.md"
   mv "$dir/home/data/secondmates.next.md" "$dir/home/data/secondmates.md"
 
-  out=$(FM_LINEAR_ZEUS_ROUTE_ID=zues run_reconcile "$dir" "$cards") \
+  out=$(FM_LINEAR_ZEUS_ROUTE_ID=zeus run_reconcile "$dir" "$cards") \
     || fail "configured Zeus route id was not used"
   printf '%s' "$out" | jq -e '.summary.cards == 0 and .summary.workers == 0' >/dev/null \
     || fail "configured Zeus route returned an invalid reconciliation: $out"
@@ -495,7 +495,7 @@ route=local
 parent_home=$dir/home
 EOF
   write_owner_meta "$dir/home/state/zeus.meta" zeus "$zeus_home" jarvis w-zeus t-zeus p-zeus
-  printf '%s\n' "- zeus - Operating Studio delivery (home: $zeus_home; scope: Operating Studio delivery; projects: operating-studio; added 2026-09-22)" > "$dir/home/data/secondmates.md"
+  printf '%s\n' "- zues - Operating Studio delivery (home: $zeus_home; scope: Operating Studio delivery; projects: operating-studio; added 2026-09-22)" > "$dir/home/data/secondmates.md"
   printf '%s\n' '{"cards":[]}' > "$cards"
   out=$(FM_TEST_HERDR_DISCOVERY=zeus-moved run_reconcile "$dir" "$cards") \
     || fail "local registered Zeus inventory failed"

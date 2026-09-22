@@ -21,7 +21,7 @@ schema=fm-secondmate-parent.v1
 route=local
 parent_home=$PRIMARY_HOME
 EOF
-printf '%s\n' '- zeus - Operating Studio delivery (home: /zeus; scope: Operating Studio; projects: operating-studio; added 2026-09-22)' > "$PRIMARY_HOME/data/secondmates.md"
+printf '%s\n' '- zues - Operating Studio delivery (home: /zeus; scope: Operating Studio; projects: operating-studio; added 2026-09-22)' > "$PRIMARY_HOME/data/secondmates.md"
 cat > "$HOME_DIR/.env" <<'EOF'
 FM_LINEAR_READONLY_API_KEY=read-only-secret
 FM_LINEAR_OPERATING_STUDIO_TEAM_ID=team-os

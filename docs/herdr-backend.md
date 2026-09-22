@@ -223,7 +223,7 @@ Workspace and tab ids support verification and cleanup but are not inferred from
 A task records its immutable Linear issue id as `linear_card_id=` through `fm-spawn.sh --linear-card-id <id>`.
 The command joins that id to the card id and joins the task to its recorded Herdr session and pane ids, never to titles, pane order, or totals.
 The comparison command runs `--linear-api` with `LINEAR_API_KEY`, `FM_LINEAR_OPERATING_STUDIO_TEAM_ID`, and `FM_LINEAR_OPERATING_STUDIO_PROJECT_ID` set locally.
-Comparison resolves the `zeus` secondmate through the primary home's `data/secondmates.md` and obtains a fresh inventory from the registered local home or through its registered `fm-on.sh` route.
+Comparison resolves the `zues` secondmate through the primary home's `data/secondmates.md` and obtains a fresh inventory from the registered local home or through its registered `fm-on.sh` route.
 The primary rejects an unavailable route, invalid returned inventory, or returned home that differs from the registered home.
 API mode refuses to run without both identities, filters by both, and reads every result page.
 The command always emits one JSON object that names exact identity, verified-live-worker count, duplicate, and home-scoped endpoint discrepancies as well as `needs-deep-check` results.

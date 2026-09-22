@@ -242,7 +242,7 @@ action_arm() {
     return 1
   }
   if ! secondmate_registry_validate_bindings \
-    "$primary_data/secondmates.md" secondmate_registry_path_key zeus; then
+    "$primary_data/secondmates.md" secondmate_registry_path_key zues; then
     printf 'fm-herdr-linear-check: primary Zeus route is unavailable: %s\n' "$SECONDMATE_REGISTRY_ERROR" >&2
     return 1
   fi
