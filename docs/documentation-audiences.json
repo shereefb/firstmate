@@ -297,6 +297,10 @@
       "audience": "maintainer-architecture"
     },
     {
+      "path": "docs/board-loop.md",
+      "audience": "maintainer-architecture"
+    },
+    {
       "path": "docs/calm-mode-feasibility.md",
       "audience": "maintainer-verification"
     },
