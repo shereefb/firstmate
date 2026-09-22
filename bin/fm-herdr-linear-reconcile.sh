@@ -3,11 +3,12 @@
 #
 # Usage:
 #   fm-herdr-linear-reconcile.sh --inventory --json
-#   fm-herdr-linear-reconcile.sh --linear-api --zeus-inventory <inventory.json> [--json]
+#   fm-herdr-linear-reconcile.sh --linear-api [--json]
 #
 # `--inventory` is run by each owning home. It reads only that home's direct
 # child metadata and asks Herdr for each recorded endpoint. A parent receives a
-# secondmate inventory as an input; it never enumerates the secondmate's panes.
+# fresh secondmate inventory through its registered route; it never enumerates
+# the secondmate's panes itself.
 # The comparison joins a Linear issue's immutable `id` to `linear_card_id=` in
 # task metadata, and endpoint identity to the task's recorded Herdr ids. It
 # deliberately does not inspect pane text, fm-crew-state, validation, or PRs.
@@ -35,7 +36,6 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 . "$SCRIPT_DIR/fm-secondmate-registry-lib.sh"
 
 MODE=compare
-ZEUS_INVENTORY=
 JSON_ONLY=0
 LINEAR_API=0
 ZEUS_ID=zeus
@@ -43,7 +43,7 @@ ZEUS_ID=zeus
 usage() {
   cat <<'EOF'
 usage: fm-herdr-linear-reconcile.sh --inventory --json
-       fm-herdr-linear-reconcile.sh --linear-api --zeus-inventory <inventory.json> [--json]
+       fm-herdr-linear-reconcile.sh --linear-api [--json]
 
 Read-only Herdr and Linear reconciliation for Operating Studio cards.
 EOF
@@ -52,11 +52,6 @@ EOF
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --inventory) MODE=inventory ;;
-    --zeus-inventory)
-      shift
-      [ "$#" -gt 0 ] || { echo 'fm-herdr-linear-reconcile: --zeus-inventory requires a file' >&2; exit 2; }
-      ZEUS_INVENTORY=$1
-      ;;
     --linear-api) LINEAR_API=1 ;;
     --json) JSON_ONLY=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -70,13 +65,9 @@ done
     echo 'fm-herdr-linear-reconcile: comparison requires --linear-api' >&2
     exit 2
   }
-  [ -n "$ZEUS_INVENTORY" ] || {
-    echo 'fm-herdr-linear-reconcile: comparison requires --zeus-inventory <file>' >&2
-    exit 2
-  }
 }
 [ "$MODE" = compare ] || {
-  [ -z "$ZEUS_INVENTORY" ] && [ "$LINEAR_API" = 0 ] || {
+  [ "$LINEAR_API" = 0 ] || {
     echo 'fm-herdr-linear-reconcile: --inventory accepts only --json' >&2
     exit 2
   }
@@ -164,10 +155,27 @@ if [ "$MODE" = inventory ]; then
   exit 0
 fi
 
-[ -f "$ZEUS_INVENTORY" ] && [ ! -L "$ZEUS_INVENTORY" ] || {
-  echo "fm-herdr-linear-reconcile: Zeus inventory is unavailable at $ZEUS_INVENTORY" >&2
+if ! secondmate_registry_validate_bindings \
+  "$DATA/secondmates.md" secondmate_registry_path_key "$ZEUS_ID"; then
+  echo "fm-herdr-linear-reconcile: Zeus route is unavailable: $SECONDMATE_REGISTRY_ERROR" >&2
   exit 1
-}
+fi
+zeus_registered_home=$SECONDMATE_REGISTRY_MATCH_HOME
+if [ "$SECONDMATE_REGISTRY_MATCH_REMOTE" -eq 1 ]; then
+  if ! "$SCRIPT_DIR/fm-on.sh" "$ZEUS_ID" \
+    fm-herdr-linear-reconcile.sh --inventory --json > "$TMP/zeus.json"; then
+    echo 'fm-herdr-linear-reconcile: could not obtain live Zeus inventory through its registered route' >&2
+    exit 1
+  fi
+else
+  if ! FM_HOME="$zeus_registered_home" \
+    FM_STATE_OVERRIDE="$zeus_registered_home/state" \
+    FM_DATA_OVERRIDE="$zeus_registered_home/data" \
+    "$SCRIPT_DIR/fm-herdr-linear-reconcile.sh" --inventory --json > "$TMP/zeus.json"; then
+    echo 'fm-herdr-linear-reconcile: could not obtain live Zeus inventory from its registered home' >&2
+    exit 1
+  fi
+fi
 jq -e '
   .schema == "fm-herdr-linear-inventory.v1"
   and ((.home | type) == "string" and (.home | length) > 0)
@@ -183,17 +191,15 @@ jq -e '
     and (.endpoint_status as $status
       | ["alive", "dead", "missing", "ambiguous", "unreadable", "unverified", "not-applicable"]
       | index($status) != null))
-' "$ZEUS_INVENTORY" >/dev/null 2>&1 || {
+' "$TMP/zeus.json" >/dev/null 2>&1 || {
   echo 'fm-herdr-linear-reconcile: Zeus inventory is invalid' >&2
   exit 1
 }
-zeus_home=$(jq -r '.home' "$ZEUS_INVENTORY")
-if ! secondmate_registry_validate_bindings \
-  "$DATA/secondmates.md" secondmate_registry_path_key "$ZEUS_ID" "$zeus_home"; then
-  echo "fm-herdr-linear-reconcile: Zeus inventory does not match its registered route: $SECONDMATE_REGISTRY_ERROR" >&2
+zeus_home=$(jq -r '.home' "$TMP/zeus.json")
+if [ "$zeus_home" != "$zeus_registered_home" ]; then
+  echo "fm-herdr-linear-reconcile: live Zeus inventory returned home $zeus_home instead of $zeus_registered_home" >&2
   exit 1
 fi
-cp "$ZEUS_INVENTORY" "$TMP/zeus.json"
 
 command -v curl >/dev/null 2>&1 || {
     echo 'fm-herdr-linear-reconcile: curl is required for --linear-api' >&2

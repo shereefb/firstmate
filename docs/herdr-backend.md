@@ -222,12 +222,12 @@ Workspace and tab ids support verification and cleanup but are not inferred from
 `bin/fm-herdr-linear-reconcile.sh` provides a read-only first pass for Operating Studio's In Progress and In Review Linear cards.
 A task records its immutable Linear issue id as `linear_card_id=` through `fm-spawn.sh --linear-card-id <id>`.
 The command joins that id to the card id and joins the task to its recorded Herdr session and pane ids, never to titles, pane order, or totals.
-Run `fm-herdr-linear-reconcile.sh --inventory --json` in a secondmate home such as Zeus, then pass its returned inventory to the primary with `--zeus-inventory <file>`; the primary does not enumerate Zeus's child panes.
-The primary runs `--linear-api --zeus-inventory <file>` with `LINEAR_API_KEY`, `FM_LINEAR_OPERATING_STUDIO_TEAM_ID`, and `FM_LINEAR_OPERATING_STUDIO_PROJECT_ID` set locally.
-Comparison resolves the `zeus` secondmate through the primary home's `data/secondmates.md` and rejects an inventory whose home does not match that registered local or remote route.
+The primary runs `--linear-api` with `LINEAR_API_KEY`, `FM_LINEAR_OPERATING_STUDIO_TEAM_ID`, and `FM_LINEAR_OPERATING_STUDIO_PROJECT_ID` set locally.
+Comparison resolves the `zeus` secondmate through the primary home's `data/secondmates.md` and obtains a fresh inventory from the registered local home or through its registered `fm-on.sh` route.
+The primary rejects an unavailable route, invalid returned inventory, or returned home that differs from the registered home.
 API mode refuses to run without both identities, filters by both, and reads every result page.
 The report names exact identity, duplicate, endpoint, and board-review discrepancies as well as `needs-deep-check` results; use the existing crew-state, validation, PR, and targeted pane checks to settle those results.
-No scheduler is installed: a heartbeat or check owner may consume this report only after it owns Linear credentials and the returned input boundary.
+No scheduler is installed: a heartbeat or check owner may consume this report only after it owns Linear credentials and the registered Zeus route.
 `tests/fm-herdr-linear-reconcile.test.sh` covers the portable behavior.
 
 ## Current transport behavior
